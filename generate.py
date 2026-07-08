@@ -22,7 +22,7 @@ def generate(args, g_ema, device, mean_latent):
                 f"sample/{str(i).zfill(6)}.png",
                 nrow=1,
                 normalize=True,
-                range=(-1, 1),
+                value_range=(-1, 1),
             )
 
 
@@ -71,7 +71,7 @@ if __name__ == "__main__":
     g_ema = Generator(
         args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
     ).to(device)
-    checkpoint = torch.load(args.ckpt)
+    checkpoint = torch.load(args.ckpt, weights_only=False)
 
     g_ema.load_state_dict(checkpoint["g_ema"])
 
