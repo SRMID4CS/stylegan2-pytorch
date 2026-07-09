@@ -133,3 +133,5 @@ wandb/
 *.pkl
 
 data/
+samples_audio/
+checkpoint/

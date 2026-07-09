@@ -29,10 +29,25 @@ are a **cross-repo contract** carried in the sidecar (spec §2, §4, §6, §9).
 - **Phase 0: Docs + environment** *(2026-07-08)* — this `ROADMAP.md`, `USAGE.md`,
   `README_AUDIO.md`, `env.yml` (conda, cu128 wheels for Blackwell laptop + Ada AWS).
   No code changes yet.
+- **Phase 1: Image smoke test** *(2026-07-09)* — unmodified loop verified locally:
+  LMDB dataprep, training convergence on ~10 images, JIT CUDA ops on the RTX 5070 Ti,
+  checkpoint round-trip through `generate.py`. All working.
+- **Phase 2: Audio GAN modifications** *(2026-07-09)* — implemented (all items below);
+  contract module + 1-ch model wiring verified on CPU (`T=86`, affine/canvas round-trip
+  ~1e-6, `n_latent==12`, 3-ch regression intact). Training/vocoding validation happens
+  in Phase 3 (user-run, WSL).
 
 ### In Progress
 
-- Phase 1 (image smoke test) — next up.
+- Phase 3 (audio overfit smoke on `data/audio_mnist_test/`, run in WSL) — commands
+  ready in `USAGE.md` §3.
+
+**Next-session first tasks:**
+
+1. Run the Phase 3 smoke in WSL (USAGE §3): prep (`held_out` must log `['02']`),
+   rung-1 round-trip BEFORE training, overfit run, sample + listen (`_BVG`/`_GL`).
+2. Fix anything the smoke surfaces; record results here.
+3. Start Phase 4 `unit_test/` suite.
 
 ---
 
@@ -62,47 +77,50 @@ touching anything. ~10 images, overfit, eyeball samples.
 **Exit criterion:** samples visibly reproduce the training images; no NaNs; a saved
 checkpoint round-trips through `generate.py`.
 
-## Phase 2 — Audio GAN modifications (spec §3–§6)
+## Phase 2 — Audio GAN modifications (spec §3–§6) — DONE 2026-07-09
 
-Ordered; each item cites the spec section that locks it.
+All items implemented; each cites the spec section that locks it.
 
-1. **Shared mel/contract module** (`audio/` package): vendor BigVGAN's
-   `get_mel_spectrogram` and implement the global affine (§4) and canvas
-   embed/crop (§3.5) as small pure functions. This exact module is later copied
-   verbatim into dlg-sonic (spec §6 "best practice") — keep it dependency-light.
-2. **Data-prep script** (`prepare_audio_data.py`): waveform → resample 22050 mono →
-   pad/truncate waveform to 22050 samples → BigVGAN mel `(80,T)` → clamp + global
-   affine → embed in 128×128 canvas at fixed offset → save float32 `.npy`
-   `(1,128,128)` (§3, exact order; never PNG, never mel-space padding).
-   Derive `T` empirically, don't hardcode (§2). Compute `m_hi` over the TRAIN set
-   once and freeze it (§4). Emit `speaker_split.json` + a prep manifest holding
-   `T`, `m_lo`, `m_hi`, offset for the sidecar.
-3. **id-disjoint speaker split** (§3, §9): split by SPEAKER, seeded;
-   AudioMNIST hold out ~10–12/60 speakers, Speech Commands a disjoint hash set.
-   Training consumes ONLY train-speaker clips.
-4. **Float32 `.npy` Dataset** (`dataset.py` addition, e.g. `NpyMelDataset`):
-   bypass LMDB/PIL entirely; returns `(1,128,128)` float32 tensors already in
-   `[-1,1]` — so the train transform must apply **no flip, no ToTensor-rescale,
-   no Normalize**.
-5. **Single-channel model patch** (§5): `ToRGB` output channels 3→1
-   ([model.py:376](model.py#L376)) and Discriminator input `ConvLayer(3,…)`→1
-   ([model.py:655](model.py#L655)); expose as a `channels`/`img_channels` arg
-   rather than hardcoding, default 3 to keep the image path working.
-6. **train.py audio path**: `--dataset npy` (or similar) switch; remove
-   `RandomHorizontalFlip` + 3-ch `Normalize` for the audio path
-   ([train.py:512-518](train.py#L512-L518)) — x-flip is time reversal, banned (§5, §8);
-   `--ckpt_every` / `--sample_every` args; seed all RNGs from one `--seed` (§9).
-7. **Augmentation policy** (§5): default OFF; add a pruned aug mode
-   (translation + cutout only) selectable by flag for later overfitting rescue;
-   never enable the geometric/color pipeline on mels.
-8. **Checkpoint sidecar writer** (§6): on every checkpoint save, emit
-   `<ckpt>.json` with mel_config, vocoder id, mel_shape, canvas, offset,
-   pad_value, affine, `num_ws` (= `g.n_latent` = 12 at 128), `w_dim` (512),
-   `w_avg` (`g_ema.mean_latent(n)`, stored as a tensor file or embedded list),
-   dataset, split seed, train/held-out speaker lists.
-9. **Sampling/eval helpers**: `generate_audio.py` — `z → G → crop → inverse
-   affine → BigVGAN → .wav`, plus GT-mel-vocode upper-bound mode (§7.2) and
-   mel-canvas PNG dumps for quick visual checks (PNG for *viewing only*).
+1. ✅ **Shared mel/contract module** (`audio/` package): `audio/meldataset.py` +
+   `audio/env.py` vendored VERBATIM from NVIDIA/BigVGAN (pinned commit in
+   `audio/contract.py::BIGVGAN_COMMIT`); `audio/contract.py` holds `MEL_CONFIG`,
+   the global affine (§4), canvas embed/crop (§3.5), and waveform pad/truncate as
+   pure functions taking all geometry as arguments. This package (minus
+   `audio/bigvgan/`) is what gets copied verbatim into dlg-sonic (spec §6).
+   `audio/bigvgan/` additionally vendors BigVGAN's inference code (vocoder only,
+   weights pulled from HF at first use) — not part of the contract copy.
+2. ✅ **Data-prep script** (`prepare_audio_data.py`): waveform → resample 22050 mono →
+   pad/truncate waveform → BigVGAN mel `(80,T)` → clamp + global affine → embed in
+   canvas → float32 `.npy` `(1,128,128)` (§3, exact order; never PNG, never
+   mel-space padding). `T` derived empirically (=86 verified); `m_hi` = 99.9th
+   percentile over the TRAIN set, frozen (§4). Emits `speaker_split.json` +
+   `prep_manifest.json`; all `[AUDIO]`-tagged logging incl. the split result.
+3. ✅ **id-disjoint speaker split** (§3, §9): speaker-level, seeded
+   (`--split-seed`, `--holdout N` / `--no-split`); only train-speaker clips are
+   processed; held-out speakers logged for seed verification.
+4. ✅ **Float32 `.npy` Dataset** (`dataset.py::NpyMelDataset`): no LMDB/PIL,
+   returns float32 tensors already in `[-1,1]`, **no flip / ToTensor-rescale /
+   Normalize**; shape validated against the prep manifest.
+5. ✅ **Single-channel model patch** (§5): `ToRGB(..., out_channel=)` and
+   `Generator/Discriminator(..., img_channels=3)` in `model.py` — config-level,
+   default 3 keeps the image path bit-identical (regression verified).
+6. ✅ **train.py audio path**: `--dataset npy` switch (validates `--size` /
+   `--img_channels` against `prep_manifest.json`); npy path applies **no
+   transform** (x-flip = time reversal, banned §5/§8); `--ckpt_every` /
+   `--sample_every`; one `--seed` for python/numpy/torch/cuda (§9).
+7. ✅ **Augmentation policy** (§5): implementation KEPT (this repo is StyleGAN2 —
+   the optional ADA-style `--augment` stays available for the image path) but
+   **hard-blocked for `--dataset npy`**: train.py exits with an `[AUDIO]` error if
+   combined. No augmentation is valid for mels; no pruned-aug mode is planned.
+8. ✅ **Checkpoint sidecar writer** (§6): every checkpoint save on the npy path
+   also writes `checkpoint/<iter>.json` = prep manifest + speaker split +
+   `latent {num_ws: g.n_latent (=12 at 128), w_dim}` + `w_avg`
+   (`g_ema.mean_latent(4096)` under a forked fixed-seed RNG, embedded as a list).
+9. ✅ **Sampling/eval helpers**: `generate_audio.py` — `z → G → crop → inverse
+   affine → vocoder → .wav`, everything read from the sidecar; `--vocoder
+   {bigvgan,gl,both}` (default both; file suffixes `_BVG`/`_GL`; Griffin-Lim =
+   librosa inverse of the same mel basis, no vocoder download needed); round-trip
+   and GT-mel-vocode upper-bound modes (§7.1–7.2); mel-canvas PNG dumps (viewing only).
 
 **Decisions (resolved 2026-07-09):**
 
@@ -122,9 +140,12 @@ Ordered; each item cites the spec section that locks it.
 
 ## Phase 3 — Audio overfit test (~10 clips)
 
-The spec's overfit smoke test (§7.5) plus validation ladder rung 1, on the laptop GPU.
+The spec's overfit smoke test (§7.5) plus validation ladder rung 1, run in WSL on the
+laptop GPU. Test data: `data/audio_mnist_test/data/` (speaker `01` ×4 clips trains,
+speaker `02` held out — the prep log must show `held_out_speakers=['02']`).
+Exact commands: `USAGE.md` §3.
 
-1. Prep ~10 one-second clips through `prepare_audio_data.py`.
+1. Prep the clips through `prepare_audio_data.py` (seeded split, held-out logged).
 2. **Round-trip a real clip first, before any training** (§7.1): wav → mel →
    affine → canvas → crop → inverse affine → BigVGAN → wav; must be intelligible.
    This isolates the mel/affine/vocoder chain from the GAN.
@@ -179,9 +200,8 @@ implement here):**
 ## Phase 5 — Full training + handoff
 
 1. AudioMNIST full prep (~25k clips, train speakers only).
-2. **R1 sweep** (spec §5): 2–3 values of `--r1` on short runs, pick by (mel-)FID,
-   then train long. Mixed precision on. Aug OFF unless D overfits; then pruned
-   translation/cutout only.
+2. **R1 sweep** (spec §5): 2–3 values of `--r1` on short runs, then train long.
+   Mixed precision on. No augmentation (hard-blocked on the npy path).
 3. Full run on **AWS g6e.xlarge (L40S, Ada)** — laptop is for smoke only (§1).
    Expect reasonable ~0.5 day, fuller convergence 2–4 days at 128².
 4. Repeat for Speech Commands (one generator per dataset, no cross-dataset prior).

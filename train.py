@@ -1,7 +1,9 @@
 import argparse
+import json
 import math
 import random
 import os
+import sys
 
 import numpy as np
 import torch
@@ -19,7 +21,7 @@ except ImportError:
     wandb = None
 
 
-from dataset import MultiResolutionDataset
+from dataset import MultiResolutionDataset, NpyMelDataset
 from distributed import (
     get_rank,
     synchronize,
@@ -123,7 +125,29 @@ def set_grad_none(model, targets):
             p.grad = None
 
 
-def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device):
+def write_sidecar(path, sidecar_base, g_ema, w_dim):
+    """Emit the cross-repo contract JSON next to a checkpoint (spec §6).
+
+    w_avg is drawn under a forked, fixed-seed RNG so the export never perturbs the
+    training RNG stream and stays comparable across checkpoints.
+    """
+    with torch.no_grad(), torch.random.fork_rng(
+        devices=list(range(torch.cuda.device_count()))
+    ):
+        torch.manual_seed(0)
+        w_avg = g_ema.mean_latent(4096)
+
+    sidecar = dict(sidecar_base)
+    sidecar["latent"] = {"num_ws": g_ema.n_latent, "w_dim": w_dim}
+    sidecar["w_avg"] = w_avg.squeeze(0).cpu().tolist()
+
+    with open(path, "w") as f:
+        json.dump(sidecar, f)
+
+    print(f"\n[AUDIO] sidecar written: {path}")
+
+
+def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device, sidecar_base=None):
     loader = sample_data(loader)
 
     pbar = range(args.iter)
@@ -302,7 +326,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
 
-            if i % 100 == 0:
+            if i % args.sample_every == 0:
                 with torch.no_grad():
                     g_ema.eval()
                     sample, _ = g_ema([sample_z])
@@ -314,7 +338,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                         value_range=(-1, 1),
                     )
 
-            if i % 10000 == 0:
+            if i % args.ckpt_every == 0:
                 torch.save(
                     {
                         "g": g_module.state_dict(),
@@ -328,13 +352,48 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     f"checkpoint/{str(i).zfill(6)}.pt",
                 )
 
+                if sidecar_base is not None:
+                    write_sidecar(
+                        f"checkpoint/{str(i).zfill(6)}.json",
+                        sidecar_base,
+                        g_ema,
+                        args.latent,
+                    )
+
 
 if __name__ == "__main__":
     device = "cuda"
 
     parser = argparse.ArgumentParser(description="StyleGAN2 trainer")
 
-    parser.add_argument("path", type=str, help="path to the lmdb dataset")
+    parser.add_argument(
+        "path", type=str, help="path to the dataset (lmdb dir, or .npy dir for --dataset npy)"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["lmdb", "npy"],
+        default="lmdb",
+        help="lmdb = original image pipeline; npy = float32 mel canvases from prepare_audio_data.py",
+    )
+    parser.add_argument(
+        "--img_channels",
+        type=int,
+        default=3,
+        help="channels of the generated/discriminated images (1 for mel canvases)",
+    )
+    parser.add_argument(
+        "--ckpt_every", type=int, default=10000, help="checkpoint save interval (iterations)"
+    )
+    parser.add_argument(
+        "--sample_every", type=int, default=100, help="sample grid save interval (iterations)"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="seed for python/numpy/torch/cuda RNGs (spec §9); default: unseeded",
+    )
     parser.add_argument('--arch', type=str, default='stylegan2', help='model architectures (stylegan2 | swagan)')
     parser.add_argument(
         "--iter", type=int, default=800000, help="total training iterations"
@@ -430,6 +489,51 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        print(f"seeded python/numpy/torch/cuda RNGs with {args.seed}")
+
+    sidecar_base = None
+    if args.dataset == "npy":
+        manifest_path = os.path.join(args.path, "prep_manifest.json")
+        split_path = os.path.join(args.path, "speaker_split.json")
+        if not (os.path.isfile(manifest_path) and os.path.isfile(split_path)):
+            sys.exit(
+                f"[AUDIO] {args.path} is missing prep_manifest.json / speaker_split.json — "
+                "run prepare_audio_data.py first"
+            )
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        with open(split_path) as f:
+            split = json.load(f)
+
+        if args.augment:
+            sys.exit("[AUDIO] augmentation is not valid for mel spectrograms — remove --augment")
+        canvas = manifest["canvas"]
+        if canvas[0] != canvas[1] or args.size != canvas[0]:
+            sys.exit(f"[AUDIO] --size {args.size} != prep canvas {canvas} — pass --size {canvas[0]}")
+        if args.img_channels != manifest["channels"]:
+            sys.exit(
+                f"[AUDIO] --img_channels {args.img_channels} != prep channels "
+                f"{manifest['channels']} — pass --img_channels {manifest['channels']}"
+            )
+
+        sidecar_base = dict(manifest)
+        sidecar_base.update(split)
+        print(
+            f"[AUDIO] dataset={split['dataset']} clips={manifest['num_clips']} "
+            f"mel_shape={tuple(manifest['mel_shape'])} canvas={tuple(canvas)} "
+            f"offset={tuple(manifest['offset'])} affine=(m_lo={manifest['affine']['m_lo']:.4f}, "
+            f"m_hi={manifest['affine']['m_hi']:.4f})"
+        )
+        print(
+            f"[AUDIO] split_seed={split['split_seed']} train_speakers={split['train_speakers']} "
+            f"held_out_speakers={split['held_out_speakers']}"
+        )
+
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = n_gpu > 1
 
@@ -449,14 +553,20 @@ if __name__ == "__main__":
     elif args.arch == 'swagan':
         from swagan import Generator, Discriminator
 
+    if args.arch != "stylegan2" and args.img_channels != 3:
+        sys.exit(f"--arch {args.arch} only supports img_channels=3 (audio path: --arch stylegan2)")
+    model_kwargs = {"img_channels": args.img_channels} if args.arch == "stylegan2" else {}
+
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier,
+        **model_kwargs,
     ).to(device)
     discriminator = Discriminator(
-        args.size, channel_multiplier=args.channel_multiplier
+        args.size, channel_multiplier=args.channel_multiplier, **model_kwargs
     ).to(device)
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier,
+        **model_kwargs,
     ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
@@ -478,7 +588,9 @@ if __name__ == "__main__":
     if args.ckpt is not None:
         print("load model:", args.ckpt)
 
-        ckpt = torch.load(args.ckpt, map_location=lambda storage, loc: storage)
+        ckpt = torch.load(
+            args.ckpt, map_location=lambda storage, loc: storage, weights_only=False
+        )
 
         try:
             ckpt_name = os.path.basename(args.ckpt)
@@ -509,15 +621,25 @@ if __name__ == "__main__":
             broadcast_buffers=False,
         )
 
-    transform = transforms.Compose(
-        [
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-        ]
-    )
+    if args.dataset == "npy":
+        # Mel canvases are pre-normalized float32 in [-1,1]: no flip (= time
+        # reversal), no ToTensor rescale, no Normalize (spec §5, §8).
+        dataset = NpyMelDataset(
+            args.path, expected_shape=(args.img_channels, args.size, args.size)
+        )
+        print(f"[AUDIO] loaded {len(dataset)} .npy mel canvases from {args.path}")
 
-    dataset = MultiResolutionDataset(args.path, transform, args.size)
+    else:
+        transform = transforms.Compose(
+            [
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+            ]
+        )
+
+        dataset = MultiResolutionDataset(args.path, transform, args.size)
+
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
@@ -528,4 +650,7 @@ if __name__ == "__main__":
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="stylegan 2")
 
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
+    train(
+        args, loader, generator, discriminator, g_optim, d_optim, g_ema, device,
+        sidecar_base=sidecar_base,
+    )

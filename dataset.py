@@ -1,6 +1,9 @@
 from io import BytesIO
+from pathlib import Path
 
 import lmdb
+import numpy as np
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -38,3 +41,30 @@ class MultiResolutionDataset(Dataset):
         img = self.transform(img)
 
         return img
+
+
+class NpyMelDataset(Dataset):
+    """float32 mel-canvas .npy files written by prepare_audio_data.py.
+
+    Samples are already normalized to [-1,1] and single-channel — no transform of
+    any kind is applied (no flip, no ToTensor rescale, no Normalize).
+    """
+
+    def __init__(self, path, expected_shape=None):
+        self.files = sorted(Path(path).glob("*.npy"))
+        if not self.files:
+            raise IOError(f"[AUDIO] no .npy files found in {path}")
+        self.expected_shape = tuple(expected_shape) if expected_shape is not None else None
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        arr = np.load(self.files[index])
+        if arr.dtype != np.float32:
+            raise ValueError(f"[AUDIO] {self.files[index]}: dtype {arr.dtype}, expected float32")
+        if self.expected_shape is not None and tuple(arr.shape) != self.expected_shape:
+            raise ValueError(
+                f"[AUDIO] {self.files[index]}: shape {tuple(arr.shape)}, expected {self.expected_shape}"
+            )
+        return torch.from_numpy(arr)

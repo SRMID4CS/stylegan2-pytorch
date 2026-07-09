@@ -26,9 +26,12 @@ one generator per dataset trained only on non-held-out speakers.
 
 ## Status
 
-Docs + environment done; code changes not started. See **`ROADMAP.md`** for the
-phased plan (image smoke test → audio modifications → overfit validation →
-unit tests → full training) and current status.
+Audio pipeline implemented (Phase 2): vendored BigVGAN mel contract (`audio/`),
+`prepare_audio_data.py` (seeded id-disjoint split, float32 `.npy` mel canvases),
+1-channel model + `--dataset npy` training path with per-checkpoint sidecars, and
+`generate_audio.py` (BigVGAN and/or Griffin-Lim vocoding). Augmentation is
+hard-blocked on the audio path (invalid for mels). Next: the overfit smoke run —
+see **`ROADMAP.md`** Phase 3 and `USAGE.md` §3.
 
 ## Quick start
 
@@ -36,14 +39,16 @@ unit tests → full training) and current status.
 conda env create -f env.yml
 conda activate stylegan2-audio
 
-# Image-pipeline smoke test (works today; validates the training loop as-is)
+# Audio pipeline (details + smoke-test walkthrough: USAGE.md §3)
+python prepare_audio_data.py --out data/npy_audiomnist --dataset audiomnist \
+  --holdout 10 --split-seed 0 <WAV_ROOT>
+python train.py --size 128 --batch 8 --img_channels 1 --dataset npy \
+  --seed 0 data/npy_audiomnist
+python generate_audio.py --ckpt checkpoint/XXXXXX.pt --n 8 --out samples_audio/
+
+# Original image pipeline still works (regression path, USAGE.md §2)
 python prepare_data.py --out data/lmdb_smoke --size 128 data/img_smoke
 python train.py --size 128 --batch 8 --iter 2000 data/lmdb_smoke
-
-# Audio pipeline (planned interface — see USAGE.md §3)
-python prepare_audio_data.py --out data/npy_audiomnist --dataset audiomnist <WAV_ROOT>
-python train.py --size 128 --batch 8 --img_channels 1 --dataset npy data/npy_audiomnist
-python generate_audio.py --ckpt checkpoint/XXXXXX.pt --n 8 --out samples_audio/
 ```
 
 GPU notes (Blackwell laptop vs AWS g6e) and the full command/flag reference:
