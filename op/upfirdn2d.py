@@ -1,5 +1,6 @@
 from collections import abc
 import os
+import warnings
 
 import torch
 from torch.nn import functional as F
@@ -146,7 +147,16 @@ class UpFirDn2d(Function):
         return grad_input, None, None, None, None
 
 
+# The compiled extension's old-style autograd dispatch breaks on some newer PyTorch
+# versions (e.g. "Unrecognized tensor type ID: ADInplaceOrView"). Detect that on the
+# first call and permanently fall back to the pure-PyTorch implementation, mirroring
+# conv2d_gradfix's version fallback.
+_use_compiled = True
+
+
 def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
+    global _use_compiled
+
     if not isinstance(up, abc.Iterable):
         up = (up, up)
 
@@ -156,13 +166,19 @@ def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
     if len(pad) == 2:
         pad = (pad[0], pad[1], pad[0], pad[1])
 
-    if input.device.type == "cpu":
-        out = upfirdn2d_native(input, kernel, *up, *down, *pad)
+    if input.device.type == "cpu" or not _use_compiled:
+        return upfirdn2d_native(input, kernel, *up, *down, *pad)
 
-    else:
-        out = UpFirDn2d.apply(input, kernel, up, down, pad)
+    try:
+        return UpFirDn2d.apply(input, kernel, up, down, pad)
 
-    return out
+    except RuntimeError as err:
+        _use_compiled = False
+        warnings.warn(
+            f"compiled upfirdn2d op failed on this PyTorch ({err}). "
+            "Falling back to the native PyTorch implementation."
+        )
+        return upfirdn2d_native(input, kernel, *up, *down, *pad)
 
 
 def upfirdn2d_native(

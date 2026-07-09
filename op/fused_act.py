@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import torch
 from torch import nn
@@ -107,21 +108,42 @@ class FusedLeakyReLU(nn.Module):
         return fused_leaky_relu(input, self.bias, self.negative_slope, self.scale)
 
 
-def fused_leaky_relu(input, bias=None, negative_slope=0.2, scale=2 ** 0.5):
-    if input.device.type == "cpu":
-        if bias is not None:
-            rest_dim = [1] * (input.ndim - bias.ndim - 1)
-            return (
-                F.leaky_relu(
-                    input + bias.view(1, bias.shape[0], *rest_dim), negative_slope=0.2
-                )
-                * scale
-            )
+# Same fallback rationale as op/upfirdn2d.py: the compiled extension's old-style
+# autograd dispatch breaks on some newer PyTorch versions — detect once, then use
+# the equivalent native implementation.
+_use_compiled = True
 
-        else:
-            return F.leaky_relu(input, negative_slope=0.2) * scale
+
+def fused_leaky_relu_native(input, bias=None, negative_slope=0.2, scale=2 ** 0.5):
+    if bias is not None:
+        rest_dim = [1] * (input.ndim - bias.ndim - 1)
+        return (
+            F.leaky_relu(
+                input + bias.view(1, bias.shape[0], *rest_dim),
+                negative_slope=negative_slope,
+            )
+            * scale
+        )
 
     else:
+        return F.leaky_relu(input, negative_slope=negative_slope) * scale
+
+
+def fused_leaky_relu(input, bias=None, negative_slope=0.2, scale=2 ** 0.5):
+    global _use_compiled
+
+    if input.device.type == "cpu" or not _use_compiled:
+        return fused_leaky_relu_native(input, bias, negative_slope, scale)
+
+    try:
         return FusedLeakyReLUFunction.apply(
             input.contiguous(), bias, negative_slope, scale
         )
+
+    except RuntimeError as err:
+        _use_compiled = False
+        warnings.warn(
+            f"compiled fused_bias_act op failed on this PyTorch ({err}). "
+            "Falling back to the native PyTorch implementation."
+        )
+        return fused_leaky_relu_native(input, bias, negative_slope, scale)
