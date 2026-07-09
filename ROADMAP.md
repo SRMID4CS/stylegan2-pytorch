@@ -51,6 +51,7 @@ touching anything. ~10 images, overfit, eyeball samples.
 5. Confirm a checkpoint loads back into `generate.py`.
 
 **Known gotchas to verify here:**
+
 - `op/` CUDA extensions JIT-compile on first run — on the RTX 5070 Ti (Blackwell)
   set `TORCH_CUDA_ARCH_LIST="12.0"` if the build doesn't pick up `sm_120` (spec §1).
   On Windows this also needs MSVC on PATH + `ninja`.
@@ -103,14 +104,21 @@ Ordered; each item cites the spec section that locks it.
    affine → BigVGAN → .wav`, plus GT-mel-vocode upper-bound mode (§7.2) and
    mel-canvas PNG dumps for quick visual checks (PNG for *viewing only*).
 
-**Open decisions (resolve during Phase 2, record here):**
-- FID on mels: `calc_inception.py`/`fid.py` are RGB-Inception-based; either
-  repeat the mel to 3 channels (relative metric only) or skip FID for the MVP
-  and select checkpoints by D/G loss + listening. Leaning: channel-repeat FID as
-  a relative curve for the R1 sweep.
-- Where BigVGAN code lives: pip-install from the NVIDIA GitHub repo vs. vendoring
-  `meldataset.py` only. Leaning: vendor `meldataset.py` (tiny, and it *is* the
-  contract), pull the full package only for vocoding.
+**Decisions (resolved 2026-07-09):**
+
+- **BigVGAN packaging: vendor `meldataset.py` VERBATIM** (it *is* the contract;
+  spec §6 "vendor into both repos"); clone/pull the full BigVGAN package only
+  where vocoding runs. Caveat: `get_mel_spectrogram` caches mel basis/window in
+  a **module-level dict** keyed by dtype/device/params — do NOT "clean it up"
+  or refactor it; any divergence from the copy in dlg-sonic risks silent mel
+  drift. Byte-identical is the point.
+- **FID on mels: relative tripwire only, never a selection criterion or reported
+  number.** Channel-repeat mel→3ch through RGB-Inception is meaningless in
+  absolute terms for spectrograms; keep it solely as a cheap divergence detector
+  during the R1 sweep. **Checkpoint selection for now: D/G loss + listening.**
+  Later upgrade (deferred): rung-2 held-out-embedding error (direct latent
+  optimization of held-out real mels) as the principled selector — it measures
+  representational capacity, which is what the attack needs.
 
 ## Phase 3 — Audio overfit test (~10 clips)
 
