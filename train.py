@@ -30,7 +30,7 @@ from distributed import (
     get_world_size,
 )
 from op import conv2d_gradfix
-from non_leaking import augment, AdaptiveAugment
+from non_leaking import augment, augment_audio, AdaptiveAugment
 
 
 def data_sampler(dataset, shuffle, distributed):
@@ -180,6 +180,15 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
     if args.augment and args.augment_p == 0:
         ada_augment = AdaptiveAugment(args.ada_target, args.ada_length, 8, device)
 
+    # image mode keeps the original augment() path byte-for-byte; audio mode swaps
+    # in the mel-valid subset (AUGMENTATION_SPEC.md §B), same adaptive-p controller.
+    if args.augment_mode == "audio":
+        def augment_fn(img, p):
+            return augment_audio(img, p, args.aug_time_translation, args.aug_cutout)
+
+    else:
+        augment_fn = augment
+
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
 
     for idx in pbar:
@@ -200,8 +209,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         fake_img, _ = generator(noise)
 
         if args.augment:
-            real_img_aug, _ = augment(real_img, ada_aug_p)
-            fake_img, _ = augment(fake_img, ada_aug_p)
+            real_img_aug, _ = augment_fn(real_img, ada_aug_p)
+            fake_img, _ = augment_fn(fake_img, ada_aug_p)
 
         else:
             real_img_aug = real_img
@@ -228,7 +237,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             real_img.requires_grad = True
 
             if args.augment:
-                real_img_aug, _ = augment(real_img, ada_aug_p)
+                real_img_aug, _ = augment_fn(real_img, ada_aug_p)
 
             else:
                 real_img_aug = real_img
@@ -250,7 +259,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         fake_img, _ = generator(noise)
 
         if args.augment:
-            fake_img, _ = augment(fake_img, ada_aug_p)
+            fake_img, _ = augment_fn(fake_img, ada_aug_p)
 
         fake_pred = discriminator(fake_img)
         g_loss = g_nonsaturating_loss(fake_pred)
@@ -463,6 +472,26 @@ if __name__ == "__main__":
         "--augment", action="store_true", help="apply non leaking augmentation"
     )
     parser.add_argument(
+        "--augment_mode",
+        type=str,
+        choices=["image", "audio"],
+        default="image",
+        help="ADA transform set: image = original pipeline; audio = mel-valid subset "
+        "(time translation + cutout only, AUGMENTATION_SPEC.md §B)",
+    )
+    parser.add_argument(
+        "--aug_time_translation",
+        type=float,
+        default=0.125,
+        help="audio mode: max time-axis translation as a fraction of canvas width",
+    )
+    parser.add_argument(
+        "--aug_cutout",
+        type=float,
+        default=0.4,
+        help="audio mode: cutout size as a fraction of the canvas",
+    )
+    parser.add_argument(
         "--augment_p",
         type=float,
         default=0,
@@ -496,6 +525,9 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(args.seed)
         print(f"seeded python/numpy/torch/cuda RNGs with {args.seed}")
 
+    if args.augment_mode == "audio" and args.dataset != "npy":
+        sys.exit("[AUDIO] --augment_mode audio is for mel canvases — pass --dataset npy")
+
     sidecar_base = None
     if args.dataset == "npy":
         manifest_path = os.path.join(args.path, "prep_manifest.json")
@@ -510,8 +542,17 @@ if __name__ == "__main__":
         with open(split_path) as f:
             split = json.load(f)
 
+        if args.augment and args.augment_mode != "audio":
+            sys.exit(
+                "[AUDIO] image-mode ADA transforms are invalid for mel spectrograms — "
+                "pass --augment_mode audio (time translation + cutout only)"
+            )
         if args.augment:
-            sys.exit("[AUDIO] augmentation is not valid for mel spectrograms — remove --augment")
+            print(
+                f"[AUDIO] ADA audio mode: time_translation=±{args.aug_time_translation} "
+                f"× canvas width, cutout={args.aug_cutout} × canvas, "
+                f"p={'adaptive' if args.augment_p == 0 else args.augment_p}"
+            )
         canvas = manifest["canvas"]
         if canvas[0] != canvas[1] or args.size != canvas[0]:
             sys.exit(f"[AUDIO] --size {args.size} != prep canvas {canvas} — pass --size {canvas[0]}")

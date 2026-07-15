@@ -29,9 +29,13 @@ one generator per dataset trained only on non-held-out speakers.
 Audio pipeline implemented (Phase 2): vendored BigVGAN mel contract (`audio/`),
 `prepare_audio_data.py` (seeded id-disjoint split, float32 `.npy` mel canvases),
 1-channel model + `--dataset npy` training path with per-checkpoint sidecars, and
-`generate_audio.py` (BigVGAN and/or Griffin-Lim vocoding). Augmentation is
-hard-blocked on the audio path (invalid for mels). Next: the overfit smoke run —
-see **`ROADMAP.md`** Phase 3 and `USAGE.md` §3.
+`generate_audio.py` (BigVGAN and/or Griffin-Lim vocoding). Two optional,
+independent augmentation mechanisms per **`AUGMENTATION_SPEC.md`** (both OFF by
+default): offline waveform aug at prep time (`--audio_aug`: time_shift/speed/pitch,
+train speakers only, seeded) and a mel-valid ADA discriminator aug at train time
+(`--augment --augment_mode audio`: time translation + cutout only); image-mode ADA
+remains hard-blocked for mels. Next: the overfit smoke run — see **`ROADMAP.md`**
+Phase 3 and `USAGE.md` §3.
 
 ## Quick start
 
@@ -60,6 +64,7 @@ GPU notes (Blackwell laptop vs AWS g6e) and the full command/flag reference:
 |---|---|
 | `README_AUDIO.md` | This file — what the fork is, quick start |
 | `GAN_TRAINING_SPEC.md` | Locked design decisions + cross-repo contract (the source of truth) |
+| `AUGMENTATION_SPEC.md` | Feature spec for the two augmentation mechanisms (offline waveform + ADA audio mode) |
 | `ROADMAP.md` | Phased plan, status, open decisions — updated every session |
 | `USAGE.md` | Commands, train flags, hardware notes — updated when commands change |
 | `README.md` | Original rosinality readme (image pipeline) — kept as-is |

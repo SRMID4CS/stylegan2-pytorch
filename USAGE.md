@@ -70,8 +70,11 @@ Multi-GPU (not needed for smoke): see original `README.md`.
 | `--mixing` | 0.9 | style-mixing prob |
 | `--channel_multiplier` | 2 | config-f width; keep 2 |
 | `--ckpt` | None | resume from checkpoint |
-| `--augment` | off | ADA-style non-leaking aug — **image path only; hard-blocked for `--dataset npy`** (augs are invalid for mels) |
-| `--augment_p` | 0 | 0 = adaptive p (image path only) |
+| `--augment` | off | ADA-style non-leaking aug; on the npy path it **requires `--augment_mode audio`** |
+| `--augment_mode` | image | `audio` = mel-valid transform subset: time translation + cutout only (`AUGMENTATION_SPEC.md` §B); `image` = original pipeline, unchanged |
+| `--aug_time_translation` | 0.125 | audio mode: max time-axis shift as a fraction of canvas width (replicate fill) |
+| `--aug_cutout` | 0.4 | audio mode: cutout size as a fraction of the canvas |
+| `--augment_p` | 0 | 0 = adaptive p (`--ada_target` 0.6) |
 | `--arch` | stylegan2 | `stylegan2` or `swagan` (audio: stylegan2 only) |
 | `--wandb` | off | W&B logging |
 
@@ -115,6 +118,31 @@ python train.py --size 128 --batch 8 --img_channels 1 --dataset npy \
   --seed 0 data/npy_audiomnist
 ```
 
+### Optional augmentation (both OFF by default — `AUGMENTATION_SPEC.md`)
+
+Rollout order (spec §E): train **clean** first; if the discriminator overfits,
+enable offline `--audio_aug` and re-prep (recompute `m_hi` happens automatically);
+only if still overfitting add ADA `--augment --augment_mode audio`.
+
+```bash
+# 1) Offline waveform aug at prep time (TRAIN speakers only; m_hi is recomputed
+#    over the augmented set; same --seed => byte-identical .npy outputs).
+#    Emits <stem>__aug{k}.npy next to the originals (~(1+N)x dataset) and records
+#    everything under "audio_aug" in prep_manifest.json -> checkpoint sidecars.
+python prepare_audio_data.py --out data/npy_audiomnist_aug --dataset audiomnist \
+  --holdout 10 --split-seed 0 --audio_aug --aug_variants 2 --seed 0 <WAV_ROOT>
+#    Tuning flags: --aug_types time_shift,speed,pitch[,gain] --time_shift_ms 100
+#                  --speed_range 0.10 --pitch_semitones 2.0 --gain_db 4.0
+#    Add --save_wavs (default OFF) to also write the exact 1.0 s waveforms fed to
+#    the mel extractor (originals + variants) as float32 wav under <out>/wavs/ —
+#    listening/inspection only; training never reads them.
+
+# 2) ADA discriminator aug at train time (non-leaking, applied to real+fake,
+#    adaptive p; mel-valid subset = time translation + cutout only).
+python train.py --size 128 --batch 8 --img_channels 1 --dataset npy --seed 0 \
+  --augment --augment_mode audio data/npy_audiomnist_aug
+```
+
 - `--vocoder {bigvgan,gl,both}` (default `both`) picks the waveform backend:
   **BigVGAN** (`_BVG.wav`; vendored inference code in `audio/bigvgan/`, weights
   auto-downloaded from Hugging Face on first use) and/or **Griffin-Lim**
@@ -132,17 +160,23 @@ never torchaudio/librosa). `T` is derived empirically (=86 at these settings, bu
 always read it from the manifest/sidecar). Vocoder:
 `nvidia/bigvgan_v2_22khz_80band_fmax8k_256x`, `use_cuda_kernel=False`.
 
-## 4. Unit tests **[planned — Phase 4]**
+## 4. Unit tests **[partial — augmentation suite works now]**
 
 ```bash
-pytest unit_test/ -v          # full suite (CPU-capable where possible)
-pytest unit_test/test_affine.py -v   # single file
+pytest unit_test/ -v              # full suite (CPU-capable where possible)
+pytest unit_test/test_audio_aug.py -v   # single file
 ```
 
-Suite scope (affine round-trip, canvas embed/crop, waveform padding, dataset,
-1-channel model shapes, sidecar schema, split disjointness, seeded
-reproducibility) is listed in `ROADMAP.md` Phase 4 — including which checks
-belong to dlg-sonic instead.
+Implemented (run in WSL with the env active): `test_audio_aug.py` (offline aug —
+seeded byte-identical determinism incl. an end-to-end double prep run,
+train-speaker-only application, `.npy` invariants, speed/pitch re-fit to 1.0 s,
+zero-fill time shift, manifest record) and `test_ada_audio.py` (ADA audio mode —
+identity at p=0, time-axis-only translation with replicate fill, single-rectangle
+cutout, gradient flow, shape/NaN checks, seeded determinism).
+
+Remaining Phase 4 scope (affine, canvas, waveform padding, dataset, model,
+sidecar, split) is listed in `ROADMAP.md` — including which checks belong to
+dlg-sonic instead.
 
 ## 5. Hardware notes
 

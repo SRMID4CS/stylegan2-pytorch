@@ -357,8 +357,11 @@ class GridSampleForward(autograd.Function):
 class GridSampleBackward(autograd.Function):
     @staticmethod
     def forward(ctx, grad_output, input, grid):
-        op = torch._C._jit_get_operation("aten::grid_sampler_2d_backward")
-        grad_input, grad_grid = op(grad_output, input, grid, 0, 0, False)
+        # torch >= 1.13: _jit_get_operation returns a tuple and the op grew an
+        # output_mask argument — call through the stable torch.ops.aten API.
+        grad_input, grad_grid = torch.ops.aten.grid_sampler_2d_backward(
+            grad_output, input, grid, 0, 0, False, (True, True)
+        )
         ctx.save_for_backward(grid)
 
         return grad_input, grad_grid
@@ -463,3 +466,56 @@ def augment(img, p, transform_matrix=(None, None)):
     img, C = random_apply_color(img, p, transform_matrix[1])
 
     return img, (G, C)
+
+
+# --- ADA audio mode (AUGMENTATION_SPEC.md §B) --------------------------------
+# Mel-valid subset for --augment_mode audio: time-axis translation + cutout only.
+# Everything in augment() above is invalid on a (freq, time) mel: flip = time
+# reversal, rotation/scaling/aspect mix the axes, color ops are undefined on one
+# channel. The AdaptiveAugment controller is shared unchanged.
+
+
+def random_time_translate(img, p, max_frac):
+    """Integer translation along the width (time) axis only, per sample with
+    probability p; frequency axis untouched. Border/replicate fill via index
+    clamping — reflection would create a time-reversed segment and zeros are not
+    the normalized mel floor (spec B.2)."""
+    batch, _, _, width = img.shape
+    device = img.device
+
+    select = bernoulli_sample(batch, p, device=device)
+    shift = torch.round(uniform_sample(batch, -max_frac, max_frac, device=device) * width)
+    shift = (select * shift).to(torch.long)
+
+    index = torch.arange(width, device=device).view(1, 1, 1, width) - shift.view(batch, 1, 1, 1)
+    index = index.clamp(0, width - 1).expand(img.shape)
+
+    return img.gather(3, index)
+
+
+def random_cutout(img, p, size):
+    """Single random rectangle per sample with probability p, zero-filled as in
+    ADA's cutout; `size` is the side length as a fraction of the canvas. The
+    center is uniform over the canvas, so edge rectangles clip naturally."""
+    batch, _, height, width = img.shape
+    device = img.device
+
+    select = bernoulli_sample(batch, p, device=device).view(batch, 1, 1, 1)
+    center_y = uniform_sample(batch, 0, 1, device=device).view(batch, 1, 1, 1)
+    center_x = uniform_sample(batch, 0, 1, device=device).view(batch, 1, 1, 1)
+
+    ys = (torch.arange(height, device=device, dtype=img.dtype).view(1, 1, height, 1) + 0.5) / height
+    xs = (torch.arange(width, device=device, dtype=img.dtype).view(1, 1, 1, width) + 0.5) / width
+    mask = ((ys - center_y).abs() < size / 2) & ((xs - center_x).abs() < size / 2)
+
+    return img * (1 - mask.to(img.dtype) * select)
+
+
+def augment_audio(img, p, max_translate=0.125, cutout=0.4):
+    """Non-leaking augment for mel canvases: applied to real AND fake with the
+    same adaptive p as augment(); returns the same (img, matrices) shape so the
+    train loop can swap the two transparently."""
+    img = random_time_translate(img, p, max_translate)
+    img = random_cutout(img, p, cutout)
+
+    return img, (None, None)

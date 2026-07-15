@@ -36,6 +36,26 @@ are a **cross-repo contract** carried in the sidecar (spec §2, §4, §6, §9).
   contract module + 1-ch model wiring verified on CPU (`T=86`, affine/canvas round-trip
   ~1e-6, `n_latent==12`, 3-ch regression intact). Training/vocoding validation happens
   in Phase 3 (user-run, WSL).
+- **Augmentation (`AUGMENTATION_SPEC.md`)** *(2026-07-15)* — both mechanisms, OFF by
+  default (usage: `USAGE.md` §3):
+  - **Offline waveform aug** (`prepare_audio_data.py --audio_aug`): per TRAIN clip,
+    `--aug_variants` composed copies (`speed → pitch` pre-pad, re-fit to 1.0 s,
+    `time_shift` [+ optional `gain`] post-pad) saved as `<stem>__aug{k}.npy`;
+    held-out speakers never augmented; `m_hi` recomputed over the full augmented
+    set; all params + `--seed` recorded under `audio_aug` in the manifest → sidecar.
+    Per-(seed, clip, variant) RNG ⇒ byte-identical outputs for the same seed.
+  - **ADA audio mode** (`train.py --augment --augment_mode audio`):
+    `non_leaking.augment_audio` = time-axis-only integer translation (replicate
+    fill, never reflect/zeros) + single-rectangle cutout; adaptive-p controller
+    untouched; default `image` mode and the no-aug npy path unchanged; image-mode
+    ADA still hard-blocked for `--dataset npy`.
+  - **Phase 4 started early**: `unit_test/` created with `test_audio_aug.py` +
+    `test_ada_audio.py` (16 tests, all pass in the WSL env; includes an
+    end-to-end double-prep byte-identity run on `data/audio_mnist_test`).
+  - **Fixed pre-existing break**: `non_leaking.GridSampleBackward` used the
+    torch≤1.12 `_jit_get_operation` API — image-path `--augment` crashed on
+    torch 2.13. Now calls `torch.ops.aten.grid_sampler_2d_backward`; verified by
+    short GPU runs of both image ADA (lmdb) and audio ADA (npy) paths.
 
 ### In Progress
 
@@ -47,7 +67,10 @@ are a **cross-repo contract** carried in the sidecar (spec §2, §4, §6, §9).
 1. Run the Phase 3 smoke in WSL (USAGE §3): prep (`held_out` must log `['02']`),
    rung-1 round-trip BEFORE training, overfit run, sample + listen (`_BVG`/`_GL`).
 2. Fix anything the smoke surfaces; record results here.
-3. Start Phase 4 `unit_test/` suite.
+3. Continue Phase 4 `unit_test/` suite (augmentation tests exist; affine/canvas/
+   dataset/model/sidecar/split still to write).
+4. Optionally: aug round-trip listen check (AUGMENTATION_SPEC §D.1) — vocode an
+   `__aug` variant, confirm intelligible.
 
 ---
 
@@ -111,7 +134,9 @@ All items implemented; each cites the spec section that locks it.
 7. ✅ **Augmentation policy** (§5): implementation KEPT (this repo is StyleGAN2 —
    the optional ADA-style `--augment` stays available for the image path) but
    **hard-blocked for `--dataset npy`**: train.py exits with an `[AUDIO]` error if
-   combined. No augmentation is valid for mels; no pruned-aug mode is planned.
+   combined. *Superseded 2026-07-15 by `AUGMENTATION_SPEC.md`*: the block now
+   applies only to image-mode ADA; `--augment_mode audio` (mel-valid subset) and
+   offline `--audio_aug` are available, both OFF by default.
 8. ✅ **Checkpoint sidecar writer** (§6): every checkpoint save on the npy path
    also writes `checkpoint/<iter>.json` = prep manifest + speaker split +
    `latent {num_ws: g.n_latent (=12 at 128), w_dim}` + `w_avg`
@@ -162,7 +187,11 @@ the sidecar. (Attack-side load into `stylegan2_io` happens in dlg-sonic — see 
 
 ## Phase 4 — Unit tests (`unit_test/`)
 
-Tests owned by THIS repo (pytest; CPU-capable where possible so they run anywhere):
+Tests owned by THIS repo (pytest; CPU-capable where possible so they run anywhere).
+*Started 2026-07-15: `test_audio_aug.py` + `test_ada_audio.py` cover the two
+augmentation mechanisms (seeded determinism, train-only application, `.npy`
+invariants, re-fit to 1.0 s, ADA audio-mode identity/translation/cutout/gradients).
+The items below remain to be written:*
 
 - **Mel config**: canonical values (§2) asserted in one place; empirical `T`
   derivation returns a consistent value for a 22050-sample input.
@@ -201,7 +230,9 @@ implement here):**
 
 1. AudioMNIST full prep (~25k clips, train speakers only).
 2. **R1 sweep** (spec §5): 2–3 values of `--r1` on short runs, then train long.
-   Mixed precision on. No augmentation (hard-blocked on the npy path).
+   Mixed precision on. Start with no augmentation; if D overfits follow the
+   rollout order in `AUGMENTATION_SPEC.md` §E (`--audio_aug` first, then
+   `--augment --augment_mode audio`).
 3. Full run on **AWS g6e.xlarge (L40S, Ada)** — laptop is for smoke only (§1).
    Expect reasonable ~0.5 day, fuller convergence 2–4 days at 128².
 4. Repeat for Speech Commands (one generator per dataset, no cross-dataset prior).
