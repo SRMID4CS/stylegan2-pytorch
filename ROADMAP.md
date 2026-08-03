@@ -162,6 +162,46 @@ All items implemented; each cites the spec section that locks it.
   Later upgrade (deferred): rung-2 held-out-embedding error (direct latent
   optimization of held-out real mels) as the principled selector — it measures
   representational capacity, which is what the attack needs.
+  ***Resolved 2026-07-21:*** replaced by Route B below — this is now the actual
+  tripwire in use, not just a deferred idea.
+
+- **Route B convergence curve — mel-native domain-classifier Frechet distance +
+  class-coverage entropy** *(2026-07-21)*, `eval/convergence_curve.py`: trains a
+  small mel classifier on the real TRAIN-speaker mels (id-disjoint by
+  construction — `prepare_audio_data.py` never writes held-out-speaker clips to
+  its `--out` dir), caches `(mu_r, Sigma_r)` + real class-entropy per
+  `--dataset` under `convergence_cache/<dataset>/`, then per checkpoint samples
+  `g_ema` with a frozen seed (z **and** per-layer noise — `NoiseInjection` in
+  `model.py` draws noise from the ambient RNG when `randomize_noise=True`, so
+  freezing only z would leave noise uncontrolled run-to-run) and reports the
+  Frechet distance to the cached reference plus normalized coverage entropy.
+  Never vocodes — stays in mel space throughout, runs in seconds/checkpoint.
+  Generator is rebuilt straight from each checkpoint's own saved `args` (same
+  trick as `generate_audio.py`) rather than hardcoded size/style_dim/n_mlp, so
+  it can't drift from what a checkpoint was actually trained with. This
+  **replaces the channel-repeat-Inception-FID idea** as the chosen relative
+  curve for the R1 sweep and checkpoint selection. Usage: `USAGE.md` §3.5.
+
+- **Speaker-identity convergence curve — collapse tripwire for the N1
+  speaker-diversity claim** *(2026-07-21)*, `eval/convergence_curve.py`
+  `--label-mode {content,speaker,both}` (default `both`): the same small CNN is
+  trained to predict **speaker ID over the train speakers** and the Frechet
+  distance + coverage entropy are computed in that embedding. The digit
+  (`content`) classifier saturates (~99.8% acc) and is blind to speaker-manifold
+  collapse; the speaker curve is the metric that actually detects it. Speaker
+  labels come from `speaker_split.json` `train_speakers` (the id-disjoint
+  contract), cross-checked against the `.npy` filenames and remapped to a
+  contiguous `0..K-1` head with `K = len(train_speakers)` **derived, never
+  hardcoded** (asserted at run start). Caches are namespaced per `(dataset,
+  mode)` — `convergence_cache/<dataset>/<content|speaker>/` — so the two never
+  clobber. `both` samples each checkpoint **once** (frozen seed) and embeds
+  twice, keeping both curves on identical mels at half the generation cost.
+  Reports the speaker classifier's train accuracy prominently (speaker ID from
+  1 s clips over ~48 classes is genuinely hard; `--clf-epochs` raises training
+  length if it underfits toward chance). The PNG now stacks one twin-axis panel
+  per mode and omits the untrained iter-0 point by default
+  (`--plot-omit-iter0`, PNG only — CSVs keep every checkpoint). Usage:
+  `USAGE.md` §3.5.
 
 ## Phase 3 — Audio overfit test (~10 clips)
 

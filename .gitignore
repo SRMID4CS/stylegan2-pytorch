@@ -135,3 +135,6 @@ wandb/
 data/
 samples_audio/
 checkpoint/
+convergence_cache/
+convergence_curve*.csv
+convergence_curve*.png

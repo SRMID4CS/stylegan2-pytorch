@@ -151,6 +151,58 @@ python train.py --size 128 --batch 8 --img_channels 1 --dataset npy --seed 0 \
   consumed by dlg-sonic (mel config, canvas/offset, affine, `w_avg`/`num_ws`/
   `w_dim`, speaker split). Never edit it by hand; never hardcode its values.
 
+### Checkpoint convergence curve (Route B: domain-FD + coverage entropy)
+
+Mel-native, no vocoding — scores every checkpoint in seconds. Reference stats
+and the small mel classifier are cached per `(--dataset, --label-mode)` on first
+run (later runs hit the cache instead of retraining). Two label modes: `content`
+(digit/keyword curve; saturates ~99.8% and is blind to speaker collapse) and
+`speaker` (speaker-ID curve — the collapse tripwire for the N1 speaker-diversity
+claim). `--label-mode both` (default) emits both from one sampling pass:
+
+```bash
+python eval/convergence_curve.py \
+  --npy-dir data/npy_audiomnist_aug --ckpt-glob "checkpoint/*.pt" \
+  --dataset audiomnist --num-classes 10 --label-mode both
+#   -> convergence_cache/audiomnist/{content,speaker}/{classifier.pt,reference_stats.npz} (cached)
+#      convergence_curve_content.csv, convergence_curve_speaker.csv  (ALL checkpoints, incl. iter 0)
+#      convergence_curve.png  (2-row: content top, speaker bottom; iter-0 omitted from the plot)
+
+# just one curve:
+python eval/convergence_curve.py --npy-dir data/npy_audiomnist_aug \
+  --dataset audiomnist --num-classes 10 --label-mode speaker
+
+# force classifier/reference retrain (e.g. after re-prepping the data):
+python eval/convergence_curve.py --npy-dir data/npy_audiomnist_aug --retrain \
+  --dataset audiomnist --num-classes 10 --label-mode both
+
+# AWS full-run layout (matches sweep.sh/train_full.sh):
+python eval/convergence_curve.py \
+  --npy-dir /scratch/npy_audiomnist_aug --ckpt-glob "runs/full_g2/checkpoint/*.pt" \
+  --dataset audiomnist --num-classes 10 --label-mode both
+```
+
+- `--npy-dir` must be TRAIN-speaker mels only (spec §3, §9 id-disjoint contract)
+  — any dir written by `prepare_audio_data.py` already satisfies this, since it
+  never writes held-out-speaker clips.
+- `--label-mode` `content` | `speaker` | `both` (default `both`). Speaker mode
+  derives its class set (`K` = number of train speakers, remapped to `0..K-1`)
+  from `speaker_split.json` — `--num-classes` is ignored there. Speaker ID from
+  1 s clips over ~48 classes is genuinely hard: watch the logged `train_acc`, and
+  if it sits near chance (`1/K`) the speaker embedding is uninformative — raise
+  `--clf-epochs` (default 20) to train the classifier longer.
+- `--seed` / `--n-samples` are the frozen-comparability contract: keep them
+  identical across a whole sweep, or the absolute FD numbers aren't comparable
+  checkpoint-to-checkpoint.
+- `--plot-omit-iter0` (default `True`) drops the untrained iter-0 point (whose
+  blown-out FD would crush the y-axis) from the **PNG only** — both CSVs always
+  keep it as the sanity anchor. Pass `--plot-omit-iter0 False` to plot it too.
+- `--crop-to-sidecar` (off by default) crops real+generated mels to the real
+  80×T region (via `prep_manifest.json` / each checkpoint's sidecar) instead of
+  embedding the full padded 128×128 canvas.
+- Relative tripwire only — not an absolute FID, never report the number outside
+  this repo (ROADMAP.md "FID on mels" decision).
+
 ### Canonical mel config (locked, spec §2)
 
 `sample_rate=22050, n_fft=1024, win_length=1024, hop_length=256, n_mels=80,
