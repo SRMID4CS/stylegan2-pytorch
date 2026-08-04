@@ -340,6 +340,38 @@ def norm_entropy_from_counts(counts, num_classes):
     return float(-(p * np.log(p)).sum() / np.log(num_classes))
 
 
+def size_matched_entropy(counts, n_samples, num_classes, seed=0):
+    """Reference coverage entropy resampled down to the generated sample count.
+
+    Normalized entropy is capped by the number of samples, not just by coverage:
+    at Speech Commands scale (K=2418 train speakers, --n-samples 2000) a PERFECTLY
+    covering generator can only reach log(2000)/log(2418) = 0.976, and in
+    expectation ~0.914 -- while the real reference, measured over all ~97k clips,
+    sits at ~0.998. That ~0.08 gap is pure sample-size artifact and would read as
+    speaker-manifold collapse in the one signal the N1 diversity claim rests on.
+    Drawing the reference from the same number of samples removes it (the residual
+    gap is then ~0.004). At AudioMNIST scale (K=48) the correction is ~0.003, which
+    is why this never surfaced there.
+
+    Seeded and deterministic; a no-op when the reference has fewer samples than
+    the generated set.
+    """
+    counts = np.asarray(counts, dtype=np.float64)
+    total = counts.sum()
+    if total <= 0 or n_samples >= total:
+        return norm_entropy_from_counts(counts, num_classes)
+    matched = np.random.default_rng(seed).multinomial(int(n_samples), counts / total)
+    return norm_entropy_from_counts(matched, num_classes)
+
+
+def size_matched_counts(counts, n_samples, seed=0):
+    counts = np.asarray(counts, dtype=np.float64)
+    total = counts.sum()
+    if total <= 0 or n_samples >= total:
+        return counts
+    return np.random.default_rng(seed).multinomial(int(n_samples), counts / total)
+
+
 def subset_coverage(counts, subset_indices):
     """(fraction, normalized entropy) of predictions landing in a class subset.
 
@@ -589,7 +621,21 @@ def main():
         mu_r, cov_r, ent_r, counts_r = build_reference(
             net, args.npy_dir, label_fn, num_classes, real_crop, cache_dir, device, args.batch, mode
         )
-        ctx[mode] = dict(net=net, num_classes=num_classes, mu_r=mu_r, cov_r=cov_r, ent_r=ent_r,
+        # Compare like with like: the reference entropy is measured over every real
+        # clip (~97k), the per-checkpoint one over --n-samples. See size_matched_entropy.
+        ent_r_matched = ent_r
+        if counts_r is not None:
+            ent_r_matched = size_matched_entropy(counts_r, args.n_samples, num_classes, args.seed)
+        if num_classes > args.n_samples:
+            ceiling = np.log(args.n_samples) / np.log(num_classes)
+            print(f"[eval] NOTE ({mode}): K={num_classes} classes > --n-samples {args.n_samples}, so "
+                  f"even perfect coverage caps the entropy at {ceiling:.3f}. The reference below is "
+                  f"size-matched; raise --n-samples for a tighter read (keep it frozen across a run).")
+        if abs(ent_r_matched - ent_r) > 1e-3:
+            print(f"[ref:{mode}] real class-entropy {ent_r:.3f} over all clips -> {ent_r_matched:.3f} "
+                  f"size-matched to --n-samples {args.n_samples} (that is the comparable number)")
+        ctx[mode] = dict(net=net, num_classes=num_classes, mu_r=mu_r, cov_r=cov_r,
+                         ent_r=ent_r, ent_r_matched=ent_r_matched,
                          counts_r=counts_r, digit_indices=meta["digit_indices"])
 
     # Digit-subset coverage rides on the content classifier -- no extra sampling.
@@ -608,7 +654,13 @@ def main():
             print("[eval] digit coverage: cached reference predates the class histogram -- real "
                   "reference unavailable, pass --retrain to rebuild it")
         else:
-            digit_ref = subset_coverage(counts_r, digit_indices)
+            # Fraction from the full corpus (a proportion -- unbiased, and the best
+            # estimate available); entropy size-matched, same reason as above.
+            digit_frac_r, _ = subset_coverage(counts_r, digit_indices)
+            _, digit_ent_r = subset_coverage(
+                size_matched_counts(counts_r, args.n_samples, args.seed), digit_indices
+            )
+            digit_ref = (digit_frac_r, digit_ent_r)
             print(f"[digits] real: fraction={digit_ref[0]:.3f}  entropy={digit_ref[1]:.3f}")
 
     ckpts = sorted(glob.glob(args.ckpt_glob), key=parse_iter)
@@ -635,7 +687,8 @@ def main():
             counts = class_counts(preds, c["num_classes"])
             ent = norm_entropy_from_counts(counts, c["num_classes"])
             mode_rows[mode].append((it, fd, ent))
-            print(f"iter {it:>7}  [{mode:>7}]  FD={fd:10.3f}  entropy={ent:.3f}  (real={c['ent_r']:.3f})")
+            print(f"iter {it:>7}  [{mode:>7}]  FD={fd:10.3f}  entropy={ent:.3f}  "
+                  f"(real={c['ent_r_matched']:.3f})")
             if mode == "content" and do_digits:
                 frac, dent = subset_coverage(counts, digit_indices)
                 digit_rows.append((it, frac, dent))
@@ -651,7 +704,7 @@ def main():
         write_csv(f"{args.out}_{mode}.csv", mode_rows[mode], ["iter", "fd", "entropy"])
         panels.append(dict(title=f"{mode} curve", rows=mode_rows[mode],
                            y1label="Frechet distance", y2label="coverage entropy (norm.)",
-                           y2ref=ctx[mode]["ent_r"]))
+                           y2ref=ctx[mode]["ent_r_matched"]))
     if digit_rows:
         write_csv(f"{args.out}_digits.csv", digit_rows, ["iter", "digit_fraction", "digit_entropy"])
         panels.append(dict(title="digit sub-manifold coverage (OOD read)", rows=digit_rows,

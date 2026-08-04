@@ -90,6 +90,20 @@ are a **cross-repo contract** carried in the sidecar (spec §2, §4, §6, §9).
     passed, plus `--digit-coverage` — the zero–nine coverage read that backs the
     SC→AudioMNIST OOD story. Reference cache now stores the class histogram
     (older caches still load).
+  - **Fixed a real bias in the primary signal** *(found while checking the code
+    against the real corpus scale)*: normalized coverage entropy is capped by the
+    sample count, so at `K`=2418 train speakers with `--n-samples 2000` a
+    *perfectly* covering generator scores ~0.914 against a real reference of
+    ~0.998 — an ~0.08 artifact gap that reads as speaker-manifold collapse in the
+    one metric the N1 diversity claim rests on. The reference entropy is now
+    resampled (seeded) to the same `N` before being reported/plotted; residual gap
+    ~0.004. At AudioMNIST scale (`K`=48) the correction is ~0.003, which is why it
+    never surfaced there.
+  - **Checked and deliberately left alone:** `torchaudio.functional.resample`
+    rebuilds its sinc kernel per call, but that is only ~2 min over 97k clips —
+    and a cached `torchaudio.transforms.Resample` does **not** produce
+    bit-identical output, so "optimizing" it would silently move every mel value.
+    The resampler stays exactly as AudioMNIST used it (`contract.RESAMPLER_ID`).
   - **`sweep.sh` / `train_full.sh`**: fully env-parametrized (`DATA`, `DATASET`,
     `AUGMENT`, `GAMMAS`, `RUN_TAG`, …), defaults unchanged; the sweep now runs the
     convergence curve after each gamma with frozen `--seed`/`--n-samples`.

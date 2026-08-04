@@ -142,6 +142,8 @@ python prepare_audio_data.py --dataset speech_commands \
   /scratch/speech_commands_v0.02
 #    -> ~97k .npy (train speakers only) ≈ 6 GB, speaker_split.json (200 held out),
 #       prep_manifest.json (T == AudioMNIST's, m_lo, SC m_hi, offset), clip_labels.json
+#    Scratch needs ~9 GB free: the 6 GB output plus a ~2.7 GB pass-1 mel memmap
+#    (.mel_cache.tmp in --out) that is deleted when prep finishes.
 
 # 2) Train — augmentation stays OFF (~97k clips is past the overfitting regime)
 python train.py --size 128 --batch 16 --img_channels 1 --dataset npy --seed 0 \
@@ -256,6 +258,16 @@ python eval/convergence_curve.py \
   is uninformative — raise `--clf-epochs` (default 20) to train it longer.
   **Speaker-coverage entropy stays the primary signal** on both datasets: content
   entropy structurally cannot detect speaker-manifold collapse.
+- **The reference entropy is size-matched to `--n-samples`.** Normalized entropy is
+  capped by the sample count, not just by coverage: at SC scale (`K`=2418 train
+  speakers, `--n-samples 2000`) a *perfectly* covering generator can only reach
+  `log(2000)/log(2418)` = 0.976 and in expectation scores ~0.914, while the real
+  reference over all ~97k clips sits at ~0.998. That ~0.08 gap is pure sample-size
+  artifact and would read as speaker collapse, so the reference is resampled
+  (seeded) to the same `N` before being printed and plotted. The correction is
+  ~0.003 at AudioMNIST scale (`K`=48), which is why it only shows up on SC. Raising
+  `--n-samples` tightens the read (K=2418: 5k → 0.966, 10k → 0.984, 20k → 0.992)
+  — but keep it frozen across a whole sweep.
 - Labels come from `clip_labels.json` in `--npy-dir` (speaker + digit/word,
   straight from the source walk). Content `K` is derived from it, so
   `--num-classes` is only a manual override and warns when it disagrees. A dir

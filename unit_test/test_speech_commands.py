@@ -101,6 +101,39 @@ def test_walk_flags_malformed_filenames(tmp_path):
     assert "NOTAHASH" in clips
 
 
+# The exact `ls` of an extracted GSC v0.02 tarball, verified against the real
+# scratch box on 2026-08-04: 35 word folders + _background_noise_ + four loose files.
+REAL_ROOT_ENTRIES = """LICENSE README.md _background_noise_ backward bed bird cat dog down eight
+five follow forward four go happy house learn left marvin nine no off on one right seven sheila six
+stop testing_list.txt three tree two up validation_list.txt visual wow yes zero""".split()
+REAL_LOOSE_FILES = ("LICENSE", "README.md", "testing_list.txt", "validation_list.txt")
+
+
+def test_walk_on_the_real_tarball_layout(tmp_path):
+    """The loose files and _background_noise_ must drop out, leaving exactly 35
+    words — and every spoken digit must survive (they carry the OOD story)."""
+    words = [e for e in REAL_ROOT_ENTRIES
+             if e not in REAL_LOOSE_FILES and e != da.SC_BACKGROUND_DIR]
+    assert len(words) == da.SC_NUM_WORDS
+    assert all(d in words for d in da.SC_DIGIT_WORDS)
+
+    root = tmp_path / "speech_commands_v0.02"
+    root.mkdir()
+    for name in REAL_LOOSE_FILES:
+        (root / name).write_text("x")
+    for i, word in enumerate(words):
+        write_wav(root / word / f"{i:04x}0000_nohash_0.wav", seconds=0.7, freq=300 + i)
+    write_wav(root / da.SC_BACKGROUND_DIR / "doing_the_dishes.wav", seconds=5.0, freq=80)
+
+    logged = []
+    clips, content = da.collect_clips(root, da.SPEECH_COMMANDS, log=logged.append)
+
+    assert not any("WARNING" in m for m in logged), logged
+    assert sorted(set(content.values())) == sorted(words)
+    assert sum(len(v) for v in clips.values()) == da.SC_NUM_WORDS
+    assert all(da.SC_BACKGROUND_DIR not in str(p) for v in clips.values() for p in v)
+
+
 def test_walk_rejects_a_non_sc_layout(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -440,6 +473,39 @@ def test_eval_falls_back_to_stem_parsing_without_clip_labels(sc_prep, eval_mod):
     assert K == len(WORDS) and meta_n["classes"] == meta_l["classes"]
     for path in out.glob("*.npy"):
         assert without(path.stem) == with_labels(path.stem)
+
+
+def test_size_matched_entropy_removes_the_sample_count_bias(eval_mod):
+    """K=2418 train speakers vs --n-samples 2000: a PERFECTLY covering generator
+    scores ~0.914 while the raw real reference (97k clips) scores ~0.998. That
+    ~0.08 gap is sample-size artifact, not collapse — and speaker-coverage entropy
+    is the primary signal, so it has to be comparable."""
+    K, n_gen = 2418, 2000
+    rng = np.random.default_rng(0)
+    p = np.ones(K) / K
+    real_counts = rng.multinomial(97_000, p)
+    gen_counts = rng.multinomial(n_gen, p)
+
+    raw = eval_mod.norm_entropy_from_counts(real_counts, K)
+    gen = eval_mod.norm_entropy_from_counts(gen_counts, K)
+    matched = eval_mod.size_matched_entropy(real_counts, n_gen, K, seed=0)
+
+    assert raw - gen > 0.05                      # the bias is real and large
+    assert abs(matched - gen) < 0.01             # ... and size-matching removes it
+    assert matched <= np.log(n_gen) / np.log(K) + 1e-9   # respects the hard ceiling
+
+    # Deterministic, and a no-op when the reference is not larger than the sample.
+    assert matched == eval_mod.size_matched_entropy(real_counts, n_gen, K, seed=0)
+    assert eval_mod.size_matched_entropy(real_counts, 10**9, K, seed=0) == raw
+
+
+def test_size_matched_entropy_is_a_noop_at_audiomnist_scale(eval_mod):
+    K = 48
+    rng = np.random.default_rng(0)
+    real_counts = rng.multinomial(25_000, np.ones(K) / K)
+    raw = eval_mod.norm_entropy_from_counts(real_counts, K)
+    matched = eval_mod.size_matched_entropy(real_counts, 2000, K, seed=0)
+    assert abs(raw - matched) < 0.01             # ~0.003 — invisible, as observed
 
 
 def test_digit_subset_coverage(eval_mod):
