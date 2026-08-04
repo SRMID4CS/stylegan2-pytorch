@@ -118,6 +118,62 @@ python train.py --size 128 --batch 8 --img_channels 1 --dataset npy \
   --seed 0 data/npy_audiomnist
 ```
 
+### Speech Commands v0.02 (`SPEECH_COMMANDS_SPEC.md`)
+
+A **second, independent** generator — one per dataset, no cross-dataset prior.
+Everything except `m_hi`, the dataset name, the speaker lists and `split_seed` is
+byte-identical to AudioMNIST, so the only new thing is the source walk.
+
+```bash
+# 0) Get the RAW tarball (NOT TFDS speech_commands — it strips the speaker id and
+#    collapses to 12 classes, so it cannot support the id-disjoint split).
+#    Extract on ext4 scratch, not DrvFs /mnt/d.
+curl -O http://download.tensorflow.org/data/speech_commands_v0.02.tar.gz   # ~2.3 GB
+mkdir -p /scratch/speech_commands_v0.02
+tar xzf speech_commands_v0.02.tar.gz -C /scratch/speech_commands_v0.02
+
+# 1) Prep: 35 word folders (speaker = filename hash before the first underscore),
+#    _background_noise_/ skipped, 16 kHz -> 22050, 200 speakers held out.
+#    --reference-manifest cross-checks the frozen mel contract (mel_shape/T,
+#    mel_config, canvas, offset) against the already-prepared AudioMNIST dir.
+python prepare_audio_data.py --dataset speech_commands \
+  --out /scratch/npy_speech_commands --holdout 200 --split-seed 0 \
+  --reference-manifest /scratch/npy_audiomnist/prep_manifest.json \
+  /scratch/speech_commands_v0.02
+#    -> ~97k .npy (train speakers only) ≈ 6 GB, speaker_split.json (200 held out),
+#       prep_manifest.json (T == AudioMNIST's, m_lo, SC m_hi, offset), clip_labels.json
+
+# 2) Train — augmentation stays OFF (~97k clips is past the overfitting regime)
+python train.py --size 128 --batch 16 --img_channels 1 --dataset npy --seed 0 \
+  --r1 <gamma from the sweep> /scratch/npy_speech_commands
+
+# 3) Convergence curve: speaker (primary) + all 35 words + the digit-subset OOD read
+python eval/convergence_curve.py --npy-dir /scratch/npy_speech_commands \
+  --ckpt-glob "checkpoint/*.pt" --dataset speech_commands --label-mode both
+```
+
+SC-specific prep flags:
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--dataset speech_commands` | audiomnist | selects the GSC walk *and* names the sidecar |
+| `--holdout` | — | **200** for SC (locked, spec §3); the 400 attack targets are drawn from those held-out speakers **attack-side**, in dlg-sonic |
+| `--reference-manifest` | None | another dataset's `prep_manifest.json`; the mel contract must match it exactly or prep stops |
+| `--expect-speakers` | None | fatal assert on the unique-speaker count (GSC v0.02: **2618**); without it a mismatch is a warning |
+| `--mel-cache` / `--mel-cache-max-gb` | auto / 2.0 | pass-1 physical mels: RAM, or a temp memmap next to `--out`. SC (~2.7 GB of mels) auto-spills; AudioMNIST stays in RAM |
+
+- `m_hi` is **recomputed over the SC train speakers and frozen** — never reuse
+  AudioMNIST's. The affines stay independent; widening one to cover the other is
+  an attack-side concern (dlg-sonic rung-2), not this repo's.
+- `clip_labels.json` (`{npy stem: {speaker, content}}` + `content_classes` +
+  `digit_classes`) is written for every dataset and is what the convergence eval
+  reads, so labels never have to be re-parsed out of filenames.
+- SC `.npy` stems are `<speaker>__<word>_<wav stem>`: the same speaker says
+  different words with the same `_nohash_<n>` index, so the word has to be in the
+  stem or files collide. AudioMNIST naming (`<speaker>__<wav stem>`) is unchanged.
+- `_background_noise_/` is skipped, and `validation_list.txt` / `testing_list.txt`
+  are ignored — those are KWS splits, not the id-disjoint attack split.
+
 ### Optional augmentation (both OFF by default — `AUGMENTATION_SPEC.md`)
 
 Rollout order (spec §E): train **clean** first; if the discriminator overfits,
@@ -180,6 +236,13 @@ python eval/convergence_curve.py --npy-dir data/npy_audiomnist_aug --retrain \
 python eval/convergence_curve.py \
   --npy-dir /scratch/npy_audiomnist_aug --ckpt-glob "runs/full_g2/checkpoint/*.pt" \
   --dataset audiomnist --num-classes 10 --label-mode both
+
+# Speech Commands: 35-word content curve + speaker curve + the digit-subset read.
+# --num-classes is unnecessary — the class set comes from clip_labels.json.
+python eval/convergence_curve.py \
+  --npy-dir /scratch/npy_speech_commands --ckpt-glob "runs/full_g2_sc/checkpoint/*.pt" \
+  --dataset speech_commands --label-mode both
+#   -> convergence_curve_{content,speaker}.csv + convergence_curve_digits.csv
 ```
 
 - `--npy-dir` must be TRAIN-speaker mels only (spec §3, §9 id-disjoint contract)
@@ -188,9 +251,22 @@ python eval/convergence_curve.py \
 - `--label-mode` `content` | `speaker` | `both` (default `both`). Speaker mode
   derives its class set (`K` = number of train speakers, remapped to `0..K-1`)
   from `speaker_split.json` — `--num-classes` is ignored there. Speaker ID from
-  1 s clips over ~48 classes is genuinely hard: watch the logged `train_acc`, and
-  if it sits near chance (`1/K`) the speaker embedding is uninformative — raise
-  `--clf-epochs` (default 20) to train the classifier longer.
+  1 s clips over ~48 classes (AudioMNIST) or ~2418 (SC) is genuinely hard: watch
+  the logged `train_acc`, and if it sits near chance (`1/K`) the speaker embedding
+  is uninformative — raise `--clf-epochs` (default 20) to train it longer.
+  **Speaker-coverage entropy stays the primary signal** on both datasets: content
+  entropy structurally cannot detect speaker-manifold collapse.
+- Labels come from `clip_labels.json` in `--npy-dir` (speaker + digit/word,
+  straight from the source walk). Content `K` is derived from it, so
+  `--num-classes` is only a manual override and warns when it disagrees. A dir
+  prepped before that file existed still works via stem parsing. A `labels.json`
+  (`{npy_stem: int}`) next to `--npy-dir` overrides everything, as before.
+- `--digit-coverage {auto,on,off}` (default `auto`, Speech Commands only): reports
+  what fraction of generated mels the 35-word classifier calls a **zero–nine**
+  word and how evenly across those ten — the credibility hook for the
+  SC-prior → AudioMNIST OOD attack (`SPEECH_COMMANDS_SPEC.md` §5). It rides on the
+  content classifier, so it needs no extra sampling, and it is a *reporting*
+  signal, never a checkpoint selector. Emits `<out>_digits.csv` + a third panel.
 - `--seed` / `--n-samples` are the frozen-comparability contract: keep them
   identical across a whole sweep, or the absolute FD numbers aren't comparable
   checkpoint-to-checkpoint.
@@ -202,6 +278,30 @@ python eval/convergence_curve.py \
   embedding the full padded 128×128 canvas.
 - Relative tripwire only — not an absolute FID, never report the number outside
   this repo (ROADMAP.md "FID on mels" decision).
+
+### AWS run scripts (`sweep.sh`, `train_full.sh`)
+
+Both are dataset-agnostic — every knob is an env override, and the defaults
+reproduce the original AudioMNIST runs. The R1 sweep logic (2–3 `--r1` values on
+short runs, pick by the convergence curve, then train long) is identical for
+Speech Commands; only the data dir, the eval namespace and the augmentation
+switch differ.
+
+```bash
+# R1 sweep (runs the convergence curve after each gamma, frozen --seed/--n-samples)
+./sweep.sh                                              # AudioMNIST defaults
+DATA=/scratch/npy_speech_commands DATASET=speech_commands \
+  AUGMENT=false GAMMAS="10 20" ./sweep.sh               # Speech Commands
+
+# Long run at the chosen gamma
+GAMMA=2 ./train_full.sh                                 # AudioMNIST defaults
+DATA=/scratch/npy_speech_commands DATASET=speech_commands \
+  AUGMENT=false RUN_TAG=sc GAMMA=<winner> ./train_full.sh
+```
+
+`RUN_TAG` suffixes `runs/full_g<gamma>` so the two datasets' checkpoints and
+sidecars never mix (one generator per dataset — spec §5). `AUGMENT=false` for SC:
+~97k clips is well past the overfitting regime, so ADA stays off.
 
 ### Canonical mel config (locked, spec §2)
 
@@ -222,9 +322,19 @@ pytest unit_test/test_audio_aug.py -v   # single file
 Implemented (run in WSL with the env active): `test_audio_aug.py` (offline aug —
 seeded byte-identical determinism incl. an end-to-end double prep run,
 train-speaker-only application, `.npy` invariants, speed/pitch re-fit to 1.0 s,
-zero-fill time shift, manifest record) and `test_ada_audio.py` (ADA audio mode —
+zero-fill time shift, manifest record), `test_ada_audio.py` (ADA audio mode —
 identity at p=0, time-axis-only translation with replicate fill, single-rectangle
-cutout, gradient flow, shape/NaN checks, seeded determinism).
+cutout, gradient flow, shape/NaN checks, seeded determinism) and
+`test_speech_commands.py` (the SC data path — word-folder walk,
+`_background_noise_` exclusion, speaker-hash parse + malformed-filename logging,
+collision-free stems, 200-speaker seeded disjoint split, streaming `m_hi`
+percentile vs `np.percentile`, memory/disk mel-cache equivalence, derived `T`,
+`clip_labels.json`, `--reference-manifest` drift detection, and the eval's SC
+label providers + digit-subset coverage).
+
+`test_speech_commands.py` **never needs the real 2.3 GB tarball**: it builds a
+miniature corpus with the same layout and runs the real `prepare_audio_data.py`
+over it, so the whole SC path is testable on any machine.
 
 Remaining Phase 4 scope (affine, canvas, waveform padding, dataset, model,
 sidecar, split) is listed in `ROADMAP.md` — including which checks belong to

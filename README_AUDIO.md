@@ -34,8 +34,17 @@ independent augmentation mechanisms per **`AUGMENTATION_SPEC.md`** (both OFF by
 default): offline waveform aug at prep time (`--audio_aug`: time_shift/speed/pitch,
 train speakers only, seeded) and a mel-valid ADA discriminator aug at train time
 (`--augment --augment_mode audio`: time translation + cutout only); image-mode ADA
-remains hard-blocked for mels. Next: the overfit smoke run — see **`ROADMAP.md`**
-Phase 3 and `USAGE.md` §3.
+remains hard-blocked for mels.
+
+**Two datasets, two generators** (no cross-dataset prior): AudioMNIST and, per
+**`SPEECH_COMMANDS_SPEC.md`**, Speech Commands v0.02 —
+`prepare_audio_data.py --dataset speech_commands` walks the raw tarball (one
+folder per word, speaker = the filename hash, `_background_noise_` excluded),
+holds out 200 speakers, and freezes its own `m_hi`. Everything else — the mel
+config, canvas, offset, `T`, model and training path — is byte-identical, and
+`--reference-manifest` asserts that. The SC path is implemented and unit-tested
+but not yet run on the real corpus. Next: the overfit smoke run — see
+**`ROADMAP.md`** Phase 3 and `USAGE.md` §3.
 
 ## Quick start
 
@@ -49,6 +58,12 @@ python prepare_audio_data.py --out data/npy_audiomnist --dataset audiomnist \
 python train.py --size 128 --batch 8 --img_channels 1 --dataset npy \
   --seed 0 data/npy_audiomnist
 python generate_audio.py --ckpt checkpoint/XXXXXX.pt --n 8 --out samples_audio/
+
+# Speech Commands v0.02 (raw tarball, NOT TFDS — it strips the speaker id)
+python prepare_audio_data.py --dataset speech_commands --out /scratch/npy_sc \
+  --holdout 200 --split-seed 0 \
+  --reference-manifest /scratch/npy_audiomnist/prep_manifest.json \
+  /scratch/speech_commands_v0.02
 
 # Original image pipeline still works (regression path, USAGE.md §2)
 python prepare_data.py --out data/lmdb_smoke --size 128 data/img_smoke
@@ -64,6 +79,7 @@ GPU notes (Blackwell laptop vs AWS g6e) and the full command/flag reference:
 |---|---|
 | `README_AUDIO.md` | This file — what the fork is, quick start |
 | `GAN_TRAINING_SPEC.md` | Locked design decisions + cross-repo contract (the source of truth) |
+| `SPEECH_COMMANDS_SPEC.md` | The Speech Commands data path (second dataset/generator) |
 | `AUGMENTATION_SPEC.md` | Feature spec for the two augmentation mechanisms (offline waveform + ADA audio mode) |
 | `ROADMAP.md` | Phased plan, status, open decisions — updated every session |
 | `USAGE.md` | Commands, train flags, hardware notes — updated when commands change |

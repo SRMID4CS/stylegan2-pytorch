@@ -64,6 +64,22 @@ def pad_or_truncate_waveform(wav, num_samples):
     return wav[..., start : start + num_samples]
 
 
+def expected_mel_frames(num_samples, config=MEL_CONFIG):
+    """Frame count `get_mel_spectrogram` produces for `num_samples` — derived
+    from the extractor's own framing, never a hardcoded number.
+
+    The vendored `mel_spectrogram()` reflect-pads by `(n_fft - hop)//2` on each
+    side and runs `torch.stft(center=False)`, so the frame count is fixed by the
+    config alone. Use it to *check* the empirically extracted `(n_mels, T)`:
+    because the mel contract and the 1.0 s clip length are identical for every
+    dataset, `T` must come out the same for AudioMNIST and Speech Commands
+    (SPEECH_COMMANDS_SPEC.md §0). A mismatch means something drifted — stop.
+    """
+    pad = (config["n_fft"] - config["hop_length"]) // 2
+    padded = num_samples + 2 * pad
+    return 1 + (padded - config["n_fft"]) // config["hop_length"]
+
+
 def extract_mel(wav, config=MEL_CONFIG):
     """Waveform (1-D, [-1,1], config sample rate) -> physical log-mel (n_mels, T).
 

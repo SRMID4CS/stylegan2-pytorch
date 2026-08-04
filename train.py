@@ -570,10 +570,17 @@ if __name__ == "__main__":
             f"offset={tuple(manifest['offset'])} affine=(m_lo={manifest['affine']['m_lo']:.4f}, "
             f"m_hi={manifest['affine']['m_hi']:.4f})"
         )
-        print(
-            f"[AUDIO] split_seed={split['split_seed']} train_speakers={split['train_speakers']} "
-            f"held_out_speakers={split['held_out_speakers']}"
-        )
+        # Speech Commands has ~2418 train / 200 held-out hashes — print the counts
+        # and a preview, not the whole roster (the full lists go in every sidecar).
+        n_train, n_held = len(split["train_speakers"]), len(split["held_out_speakers"])
+        if max(n_train, n_held) <= 100:
+            rosters = f"train_speakers={split['train_speakers']} held_out_speakers={split['held_out_speakers']}"
+        else:
+            rosters = (
+                f"train_speakers={n_train} (first 5 {split['train_speakers'][:5]}) "
+                f"held_out_speakers={n_held} (first 5 {split['held_out_speakers'][:5]})"
+            )
+        print(f"[AUDIO] split_seed={split['split_seed']} {rosters}")
 
     n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = n_gpu > 1

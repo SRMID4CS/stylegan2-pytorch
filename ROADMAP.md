@@ -57,19 +57,63 @@ are a **cross-repo contract** carried in the sidecar (spec §2, §4, §6, §9).
     torch 2.13. Now calls `torch.ops.aten.grid_sampler_2d_backward`; verified by
     short GPU runs of both image ADA (lmdb) and audio ADA (npy) paths.
 
+- **Speech Commands data path (`SPEECH_COMMANDS_SPEC.md`)** *(2026-08-04)* — the
+  second dataset, implemented but **not yet run on real data** (the tarball is
+  downloaded on the Linux/scratch box, not here). All of it is covered by
+  `unit_test/test_speech_commands.py`, which builds a miniature corpus with the
+  real GSC layout instead of needing the 2.3 GB download:
+  - **`datasets_audio.py`** (new, stdlib-only so both prep and eval import it):
+    per-dataset source walk + label rules. SC = one folder per word,
+    `_background_noise_/` skipped, speaker = the hash before the first underscore
+    (parse verified against the listing, offenders logged not dropped),
+    `SC_DIGIT_WORDS` for the OOD read. AudioMNIST's walk moved here unchanged.
+  - **`prepare_audio_data.py --dataset speech_commands`**: same ordered pipeline
+    (16 kHz → 22050 via the existing resample call; most SC clips are *short*, so
+    they zero-pad at the WAVEFORM), `--holdout 200` seeded speaker split with an
+    explicit disjointness assert, `m_hi` recomputed over SC train and frozen,
+    `--expect-speakers` (GSC v0.02 = 2618) and `--reference-manifest` (asserts
+    `mel_shape`/`T`, `mel_config`, `canvas`, `offset` equal AudioMNIST's).
+  - **Collision-safe stems**: SC `.npy` are `<speaker>__<word>_<wav stem>` — the
+    same speaker says different words with the same `_nohash_<n>` index, so the
+    old `<speaker>__<wav stem>` naming would have silently overwritten files.
+    AudioMNIST naming unchanged.
+  - **`clip_labels.json`** (new, both datasets): `{npy stem: {speaker, content}}`
+    plus `content_classes`/`digit_classes`; the manifest carries only the summary,
+    so a 97k-entry map never lands in a contract sidecar.
+  - **Bounded-memory prep**: `T` is derived, then checked against
+    `audio.contract.expected_mel_frames()` (the extractor's own framing — still
+    never hardcoded). Pass-1 mels spill to a temp memmap past `--mel-cache-max-gb`
+    (SC ≈ 2.7 GB of mels + np.percentile's sort copy would OOM a 32 GB box) with a
+    streaming top-K percentile verified equal to `np.percentile`.
+  - **Eval** (`eval/convergence_curve.py`): label providers now read
+    `clip_labels.json` (speaker + all 35 words), content `K` is derived not
+    passed, plus `--digit-coverage` — the zero–nine coverage read that backs the
+    SC→AudioMNIST OOD story. Reference cache now stores the class histogram
+    (older caches still load).
+  - **`sweep.sh` / `train_full.sh`**: fully env-parametrized (`DATA`, `DATASET`,
+    `AUGMENT`, `GAMMAS`, `RUN_TAG`, …), defaults unchanged; the sweep now runs the
+    convergence curve after each gamma with frozen `--seed`/`--n-samples`.
+
 ### In Progress
 
 - Phase 3 (audio overfit smoke on `data/audio_mnist_test/`, run in WSL) — commands
   ready in `USAGE.md` §3.
+- Speech Commands: code done, **not yet validated on the real corpus** (spec §8
+  ladder items 1–5 still to run once the tarball is on the scratch box).
 
 **Next-session first tasks:**
 
 1. Run the Phase 3 smoke in WSL (USAGE §3): prep (`held_out` must log `['02']`),
    rung-1 round-trip BEFORE training, overfit run, sample + listen (`_BVG`/`_GL`).
 2. Fix anything the smoke surfaces; record results here.
-3. Continue Phase 4 `unit_test/` suite (augmentation tests exist; affine/canvas/
+3. On the scratch box: download + extract GSC v0.02, run the SC prep with
+   `--expect-speakers 2618` and `--reference-manifest <audiomnist manifest>`;
+   confirm ~2418 train speakers, ~97k `.npy`, `T == 86`, and a fresh SC `m_hi`.
+4. SC validation ladder (SC spec §8): round-trip a real SC clip *before* training,
+   GT-mel-vocode upper bound, then the overfit-one-sample smoke.
+5. Continue Phase 4 `unit_test/` suite (aug + SC suites exist; affine/canvas/
    dataset/model/sidecar/split still to write).
-4. Optionally: aug round-trip listen check (AUGMENTATION_SPEC §D.1) — vocode an
+6. Optionally: aug round-trip listen check (AUGMENTATION_SPEC §D.1) — vocode an
    `__aug` variant, confirm intelligible.
 
 ---
@@ -275,7 +319,10 @@ implement here):**
    `--augment --augment_mode audio`).
 3. Full run on **AWS g6e.xlarge (L40S, Ada)** — laptop is for smoke only (§1).
    Expect reasonable ~0.5 day, fuller convergence 2–4 days at 128².
-4. Repeat for Speech Commands (one generator per dataset, no cross-dataset prior).
+4. Repeat for Speech Commands (one generator per dataset, no cross-dataset prior)
+   — data path implemented, see `SPEECH_COMMANDS_SPEC.md` and `USAGE.md` §3.
+   `--holdout 200`, augmentation OFF, own `m_hi`/sidecar/`speaker_split.json`;
+   ~4× the AudioMNIST data, so expect proportionally longer wall-clock.
 5. Handoff per checkpoint: `.pt` + sidecar `.json` + `speaker_split.json`;
    run spec §7 validation items 1–5 before handing over.
 6. Then: inversion testing lives in dlg-sonic.

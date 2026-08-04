@@ -8,11 +8,21 @@ runs on the Blackwell laptop for quick local checks (pass
 TORCH_CUDA_ARCH_LIST=12.0 in the run command on that box -- see USAGE.md).
 
 Two label modes (--label-mode, default both):
-  * content  -- classify the digit/keyword; the digit CNN saturates (~99.8% acc)
+  * content  -- classify the digit/keyword (AudioMNIST: 10 digits, Speech
+                 Commands: all 35 words); the digit CNN saturates (~99.8% acc)
                  and is insensitive to speaker-manifold collapse.
   * speaker  -- classify speaker ID over the TRAIN speakers; the collapse
                  tripwire that stress-tests the N1 speaker-diversity claim.
 Each mode has its own classifier, reference (mu_r, Sigma_r) and real class-entropy.
+Labels come from prepare_audio_data.py's clip_labels.json when present (no
+re-parsing of filenames); it falls back to the naming rules in datasets_audio.py
+for .npy dirs prepared before that file existed.
+
+Speech Commands also gets a digit-subset coverage read (--digit-coverage,
+SPEECH_COMMANDS_SPEC.md §5): what fraction of generated mels the 35-word content
+classifier assigns to a zero-nine word, and how evenly across those ten. That is
+the credibility hook for the SC prior -> AudioMNIST OOD attack; it rides on the
+content classifier, so it costs nothing extra.
 
 One-time cost:  train a small mel classifier on the real TRAIN-speaker mels,
                 cache reference (mu_r, Sigma_r) and the real class-entropy.
@@ -66,47 +76,49 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from audio.contract import crop_canvas  # noqa: E402  (needs REPO_ROOT on sys.path)
+from datasets_audio import content_from_stem, speaker_from_stem  # noqa: E402
 
 EMB_DIM = 128
 DEFAULT_BATCH = 64
 LABEL_MODES = ("content", "speaker")
 
 
-# ---------- filename -> label ----------
-# prepare_audio_data.py names every .npy `<speaker>__<orig_wav_stem>[__aug{k}]`
-# (verified against prepare_audio_data.py 2026-07-21: original clips are saved as
-# f"{spk}__{path.stem}", augmented variants as f"{spk}__{path.stem}__aug{k}" --
-# so the speaker is ALWAYS the first "__"-token and survives augmentation).
-def speaker_of(stem: str) -> str:
-    """Extract the speaker id from a prepared .npy stem (first '__'-token)."""
-    parts = stem.split("__")
-    if len(parts) < 2 or not parts[0]:
-        raise ValueError(
-            f"unrecognized .npy stem {stem!r}: expected '<speaker>__<orig_stem>[__aug{{k}}]' "
-            "(prepare_audio_data.py naming)"
-        )
-    return parts[0]
+# ---------- stem -> label ----------
+# prepare_audio_data.py names every .npy `<speaker>__<orig_stem>[__aug{k}]`, so the
+# speaker is ALWAYS the first "__"-token and survives augmentation. The authoritative
+# per-clip labels are clip_labels.json (written by prepare_audio_data.py, carrying
+# speaker + content straight from the source walk); the stem parse in
+# datasets_audio.py is the fallback for dirs prepared before that file existed.
+def load_clip_labels(npy_dir):
+    """clip_labels.json as {"content_classes", "digit_classes", "clips"} or None."""
+    path = Path(npy_dir) / "clip_labels.json"
+    if not path.is_file():
+        print(f"[eval] no {path.name} in {npy_dir} -- falling back to stem parsing "
+              "(re-run prepare_audio_data.py to emit it)")
+        return None
+    doc = json.loads(path.read_text())
+    print(f"[eval] labels from {path}: {len(doc['clips'])} clips, "
+          f"{len(doc['content_classes'])} content classes "
+          f"({doc.get('content_label_type', 'content')})")
+    return doc
 
 
-# For AudioMNIST, orig_wav_stem is `<digit>_<speaker>_<rec>` (FILENAME_RE in
-# prepare_audio_data.py), so the digit is the first "_"-token of the second
-# "__"-separated part. There is no labels.json emitted by prepare_audio_data.py
-# today; drop one ({npy_stem: int}) next to --npy-dir to override/extend this.
-def content_label(stem: str, dataset: str) -> int:
-    parts = stem.split("__")
-    if len(parts) < 2:
-        raise ValueError(
-            f"unrecognized .npy stem {stem!r}: expected '<speaker>__<orig_stem>[__aug{{k}}]' "
-            "(prepare_audio_data.py naming) or a labels.json override"
-        )
-    orig_stem = parts[1]
-    if dataset == "audiomnist":
-        return int(orig_stem.split("_")[0])
-    raise NotImplementedError(
-        f"no content-label rule for --dataset {dataset!r}. prepare_audio_data.py only implements "
-        "AudioMNIST-style '<digit>_<speaker>_<rec>' source filenames today; add a rule here "
-        "for your dataset's naming, or drop a labels.json ({npy_stem: int}) next to --npy-dir."
-    )
+def speaker_of(stem: str, clip_labels=None) -> str:
+    """Speaker id of a prepared .npy stem, from clip_labels.json if available."""
+    if clip_labels is not None:
+        entry = clip_labels["clips"].get(stem)
+        if entry is not None:
+            return entry["speaker"]
+    return speaker_from_stem(stem)
+
+
+def content_of(stem: str, dataset: str, clip_labels=None) -> str:
+    """Content label (digit string / word) of a prepared .npy stem."""
+    if clip_labels is not None:
+        entry = clip_labels["clips"].get(stem)
+        if entry is not None and entry.get("content") is not None:
+            return entry["content"]
+    return content_from_stem(stem, dataset)
 
 
 def load_train_speakers(npy_dir):
@@ -120,48 +132,78 @@ def load_train_speakers(npy_dir):
     return json.loads(split_path.read_text())["train_speakers"]
 
 
-def build_label_fn(mode, npy_dir, dataset, num_classes):
-    """Return (label_fn(stem)->int, num_classes) for the requested mode.
+def build_label_fn(mode, npy_dir, dataset, num_classes, clip_labels=None):
+    """Return (label_fn(stem)->int, num_classes, meta) for the requested mode.
 
-    content: digit/keyword label (labels.json override honored), K = --num-classes.
+    content: digit/word label. Class set comes from clip_labels.json when present
+             (AudioMNIST 10 digits / Speech Commands 35 words) so --num-classes
+             never has to be right; a labels.json ({npy_stem: int}) next to
+             --npy-dir still overrides everything. `meta["digit_indices"]` are the
+             class indices of the zero-nine words, for the SC OOD coverage read.
     speaker: train-speaker id remapped to a CONTIGUOUS 0..K-1 head (K = number of
              train speakers from speaker_split.json). Non-train speakers can't
              appear -- prepare_audio_data.py only writes train clips -- but we
              cross-check the observed filenames and fail loudly if one does.
     """
+    stems = [Path(f).stem for f in sorted(glob.glob(os.path.join(npy_dir, "*.npy")))]
+    if not stems:
+        sys.exit(f"[eval] no .npy under {npy_dir}")
+
     if mode == "content":
         lj = Path(npy_dir) / "labels.json"
-        labels_map = json.loads(lj.read_text()) if lj.exists() else None
+        if lj.exists():
+            labels_map = json.loads(lj.read_text())
+            print(f"[eval] content mode: labels.json override ({len(labels_map)} entries), "
+                  f"K={num_classes} from --num-classes")
+            return (lambda stem: labels_map[stem]), num_classes, {"classes": None, "digit_indices": []}
+
+        if clip_labels is not None:
+            classes = list(clip_labels["content_classes"])
+            digit_classes = list(clip_labels.get("digit_classes") or [])
+        else:
+            # Derive the class set from the stems themselves so a pre-clip_labels
+            # dir still works; sorted() matches how prepare_audio_data.py orders it.
+            classes = sorted({content_of(s, dataset) for s in stems})
+            digit_classes = []
+        class_to_idx = {c: i for i, c in enumerate(classes)}
+        K = len(classes)
+        if num_classes is not None and num_classes != K:
+            print(f"[eval] WARNING: --num-classes {num_classes} != {K} derived content classes "
+                  f"-- using {K} (from {'clip_labels.json' if clip_labels else 'the .npy stems'})")
+        digit_indices = [class_to_idx[w] for w in digit_classes if w in class_to_idx]
+        print(f"[eval] content mode: K={K} classes {classes if K <= 40 else f'({K} classes)'}"
+              + (f"; digit subset {digit_classes}" if digit_indices else ""))
 
         def fn(stem):
-            return labels_map[stem] if labels_map else content_label(stem, dataset)
+            return class_to_idx[content_of(stem, dataset, clip_labels)]
 
-        return fn, num_classes
+        return fn, K, {"classes": classes, "digit_indices": digit_indices}
 
     if mode == "speaker":
         train_speakers = sorted(load_train_speakers(npy_dir))
         speaker_to_idx = {s: i for i, s in enumerate(train_speakers)}
         K = len(train_speakers)
 
-        observed = {speaker_of(Path(f).stem) for f in glob.glob(os.path.join(npy_dir, "*.npy"))}
+        observed = {speaker_of(s, clip_labels) for s in stems}
         unknown = sorted(observed - set(train_speakers))
         if unknown:
             sys.exit(
-                f"[eval] speaker mode: {npy_dir} contains clips from speakers {unknown} that are "
-                "NOT in speaker_split.json train_speakers -- id-disjoint contract breach (spec §3, §9)"
+                f"[eval] speaker mode: {npy_dir} contains clips from speakers "
+                f"{unknown[:20]}{' ...' if len(unknown) > 20 else ''} that are NOT in "
+                "speaker_split.json train_speakers -- id-disjoint contract breach (spec §3, §9)"
             )
         missing = sorted(set(train_speakers) - observed)
         if missing:
-            print(f"[eval] WARNING: train_speakers {missing} have no .npy clips in {npy_dir} "
-                  "(empty classes in the speaker head)")
+            print(f"[eval] WARNING: {len(missing)} train_speakers have no .npy clips in {npy_dir} "
+                  f"(empty classes in the speaker head): {missing[:20]}")
         # Contract assertion: K derived from the manifest, never hardcoded.
         assert K == len(train_speakers), "speaker K must equal len(train_speakers)"
-        print(f"[eval] speaker mode: K={K} train speakers (contiguous remap 0..{K-1}); chance acc ~= {1.0/K:.3f}")
+        print(f"[eval] speaker mode: K={K} train speakers (contiguous remap 0..{K-1}); chance acc ~= {1.0/K:.4f}")
 
         def fn(stem):
-            return speaker_to_idx[speaker_of(stem)]
+            return speaker_to_idx[speaker_of(stem, clip_labels)]
 
-        return fn, K
+        return fn, K, {"classes": train_speakers, "digit_indices": []}
 
     raise ValueError(f"unknown label mode {mode!r}")
 
@@ -276,24 +318,54 @@ def frechet_distance(mu1, cov1, mu2, cov2, eps=1e-6):
     return float(diff @ diff + np.trace(cov1 + cov2 - 2 * covmean))
 
 
+def class_counts(pred_classes, num_classes):
+    return np.bincount(np.asarray(pred_classes, dtype=np.int64), minlength=num_classes)
+
+
 def norm_entropy(pred_classes, num_classes):
+    return norm_entropy_from_counts(class_counts(pred_classes, num_classes), num_classes)
+
+
+def norm_entropy_from_counts(counts, num_classes):
     # A single class has no diversity to measure and log(1)==0 would make the
     # normalizer 0/0 -> nan (hits the degenerate single-train-speaker case).
     if num_classes <= 1:
         return 0.0
-    counts = np.bincount(pred_classes, minlength=num_classes).astype(np.float64)
-    p = counts / counts.sum()
+    counts = np.asarray(counts, dtype=np.float64)
+    total = counts.sum()
+    if total <= 0:
+        return 0.0
+    p = counts / total
     p = p[p > 0]
     return float(-(p * np.log(p)).sum() / np.log(num_classes))
 
 
+def subset_coverage(counts, subset_indices):
+    """(fraction, normalized entropy) of predictions landing in a class subset.
+
+    The SC digit sub-manifold read (SPEECH_COMMANDS_SPEC.md §5): `fraction` is how
+    much of the sample the 35-word classifier calls a zero-nine word, `entropy` is
+    how evenly it spreads across those ten. Reporting/coverage only -- never a
+    checkpoint selector (the primary signal stays speaker-coverage entropy).
+    """
+    if not subset_indices:
+        return float("nan"), float("nan")
+    sub = np.asarray(counts, dtype=np.float64)[list(subset_indices)]
+    total = float(np.asarray(counts, dtype=np.float64).sum())
+    frac = float(sub.sum() / total) if total > 0 else 0.0
+    return frac, norm_entropy_from_counts(sub, len(subset_indices))
+
+
 def build_reference(net, npy_dir, label_fn, num_classes, crop, cache_dir, device, batch, mode):
-    """Cache (mu_r, Sigma_r) and real class-entropy over ALL real TRAIN-speaker
-    mels under npy_dir. Frozen once cached -- delete the cache file to rebuild."""
+    """Cache (mu_r, Sigma_r), real class-entropy and the real class histogram over
+    ALL real TRAIN-speaker mels under npy_dir. Frozen once cached -- delete the
+    cache file to rebuild."""
     cache = cache_dir / "reference_stats.npz"
     if cache.exists():
         d = np.load(cache)
-        return d["mu"], d["cov"], float(d["entropy"])
+        # "counts" was added with the SC digit-coverage read; older caches lack it.
+        counts = d["counts"] if "counts" in d.files else None
+        return d["mu"], d["cov"], float(d["entropy"]), counts
     ds = MelNpy(npy_dir, label_fn, crop)
     dl = torch.utils.data.DataLoader(ds, batch_size=batch, num_workers=2)
     embs, preds = [], []
@@ -304,11 +376,12 @@ def build_reference(net, npy_dir, label_fn, num_classes, crop, cache_dir, device
             embs.append(e.cpu().numpy()); preds.append(logits.argmax(1).cpu().numpy())
     embs, preds = np.concatenate(embs), np.concatenate(preds)
     mu, cov = gaussian_stats(embs)
-    ent = norm_entropy(preds, num_classes)
+    counts = class_counts(preds, num_classes)
+    ent = norm_entropy_from_counts(counts, num_classes)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(cache, mu=mu, cov=cov, entropy=ent)
+    np.savez(cache, mu=mu, cov=cov, entropy=ent, counts=counts)
     print(f"[ref:{mode}] N={len(embs)}  real class-entropy={ent:.3f}")
-    return mu, cov, ent
+    return mu, cov, ent, counts
 
 
 # ---------- generator sampling ----------
@@ -401,16 +474,20 @@ def str2bool(v):
 
 
 # ---------- outputs ----------
-def write_csv(path, rows):
+def write_csv(path, rows, header):
     with open(path, "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["iter", "fd", "entropy"]); w.writerows(rows)
+        w = csv.writer(f); w.writerow(header); w.writerows(rows)
     print(f"wrote {path}")
 
 
-def write_plot(out_png, mode_rows, mode_ent_r, omit_iter0):
-    """One twin-axis panel per mode (FD + coverage entropy vs iteration), stacked
-    vertically. iter-0 is dropped from the PLOT only (default) so the untrained
-    checkpoint's blown-out FD doesn't crush the y-axis -- the CSVs keep it."""
+def write_plot(out_png, panels, omit_iter0):
+    """One twin-axis panel per entry (a left-axis series + a right-axis series vs
+    iteration), stacked vertically. iter-0 is dropped from the PLOT only (default)
+    so the untrained checkpoint's blown-out FD doesn't crush the y-axis -- the CSVs
+    keep it.
+
+    panels: [dict(title, rows=[(iter, y1, y2)], y1label, y2label, y2ref, y2lim)]
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -419,23 +496,24 @@ def write_plot(out_png, mode_rows, mode_ent_r, omit_iter0):
         print(f"[plot skipped] {e}")
         return
 
-    modes = list(mode_rows.keys())
-    fig, axes = plt.subplots(len(modes), 1, figsize=(8, 4.5 * len(modes)), squeeze=False)
-    for ax1, mode in zip(axes[:, 0], modes):
-        rows = mode_rows[mode]
-        if omit_iter0:
-            rows = [r for r in rows if r[0] != 0]
+    fig, axes = plt.subplots(len(panels), 1, figsize=(8, 4.5 * len(panels)), squeeze=False)
+    for ax1, panel in zip(axes[:, 0], panels):
+        rows = [r for r in panel["rows"] if r[0] != 0] if omit_iter0 else panel["rows"]
         if not rows:
-            ax1.set_title(f"{mode}: no rows to plot (all omitted)")
+            ax1.set_title(f"{panel['title']}: no rows to plot (all omitted)")
             continue
-        it, fd, ent = zip(*rows)
-        ax1.plot(it, fd, "o-", color="C0", label="domain-FD")
-        ax1.set_xlabel("iteration"); ax1.set_ylabel("Frechet distance", color="C0")
+        it, y1, y2 = zip(*rows)
+        ax1.plot(it, y1, "o-", color="C0")
+        ax1.set_xlabel("iteration"); ax1.set_ylabel(panel["y1label"], color="C0")
+        if panel.get("y1lim"):
+            ax1.set_ylim(*panel["y1lim"])
         ax2 = ax1.twinx()
-        ax2.plot(it, ent, "s--", color="C1", label="coverage entropy")
-        ax2.axhline(mode_ent_r[mode], color="C1", lw=0.8, alpha=0.5)
-        ax2.set_ylabel("coverage entropy (norm.)", color="C1"); ax2.set_ylim(0, 1.05)
-        ax1.set_title(f"{mode} curve" + ("  (iter-0 omitted)" if omit_iter0 else ""))
+        ax2.plot(it, y2, "s--", color="C1")
+        if panel.get("y2ref") is not None and np.isfinite(panel["y2ref"]):
+            ax2.axhline(panel["y2ref"], color="C1", lw=0.8, alpha=0.5)
+        ax2.set_ylabel(panel["y2label"], color="C1")
+        ax2.set_ylim(*panel.get("y2lim", (0, 1.05)))
+        ax1.set_title(panel["title"] + ("  (iter-0 omitted)" if omit_iter0 else ""))
     fig.tight_layout()
     fig.savefig(out_png, dpi=130)
     print(f"wrote {out_png}")
@@ -449,12 +527,18 @@ def main():
                          "id-disjoint by construction -- held-out speakers are never written here)")
     ap.add_argument("--ckpt-glob", default="checkpoint/*.pt", help="glob of checkpoints to score")
     ap.add_argument("--dataset", default="audiomnist",
-                    help="cache namespace (convergence_cache/<dataset>/<mode>/) and content label rule")
+                    help="cache namespace (convergence_cache/<dataset>/<mode>/) and content label "
+                         "rule: 'audiomnist' | 'speech_commands'")
     ap.add_argument("--label-mode", choices=["content", "speaker", "both"], default="both",
-                    help="content = digit/keyword curve; speaker = speaker-id collapse tripwire; both = both")
-    ap.add_argument("--num-classes", type=int, default=10,
-                    help="content mode: AudioMNIST=10 digits / Speech Commands=keyword count. "
-                         "Ignored in speaker mode (K is derived from speaker_split.json)")
+                    help="content = digit/word curve; speaker = speaker-id collapse tripwire; both = both")
+    ap.add_argument("--num-classes", type=int, default=None,
+                    help="content mode: override the class count (AudioMNIST=10 digits / Speech "
+                         "Commands=35 words). Normally unnecessary -- it is derived from "
+                         "clip_labels.json. Ignored in speaker mode (K comes from speaker_split.json)")
+    ap.add_argument("--digit-coverage", choices=["auto", "on", "off"], default="auto",
+                    help="extra zero-nine content-coverage read for the SC->AudioMNIST OOD story "
+                         "(SPEECH_COMMANDS_SPEC.md §5); auto = on when the dataset has a digit "
+                         "subset and content mode is active")
     ap.add_argument("--clf-epochs", type=int, default=20,
                     help="classifier training epochs (raise if speaker acc underfits toward chance)")
     ap.add_argument("--n-samples", type=int, default=2000,
@@ -487,27 +571,52 @@ def main():
         real_crop = (tuple(manifest["offset"]), tuple(manifest["mel_shape"]))
         print(f"[eval] --crop-to-sidecar: real mels cropped to offset={real_crop[0]} mel_shape={real_crop[1]}")
 
+    clip_labels = load_clip_labels(args.npy_dir)
+
     # Build/load each mode's classifier + frozen reference. Cached per (dataset, mode).
-    ctx = {}  # mode -> dict(net, num_classes, mu_r, cov_r, ent_r)
+    ctx = {}  # mode -> dict(net, num_classes, mu_r, cov_r, ent_r, counts_r, digit_indices)
     for mode in modes:
         cache_dir = Path("convergence_cache") / args.dataset / mode
-        label_fn, num_classes = build_label_fn(mode, args.npy_dir, args.dataset, args.num_classes)
+        label_fn, num_classes, meta = build_label_fn(
+            mode, args.npy_dir, args.dataset, args.num_classes, clip_labels
+        )
         if args.retrain or not (cache_dir / "classifier.pt").exists():
             net = train_classifier(args.npy_dir, label_fn, num_classes, real_crop, cache_dir, device,
                                    mode, epochs=args.clf_epochs)
         else:
             print(f"[eval] classifier cache hit ({mode}): {cache_dir / 'classifier.pt'}")
             net = load_classifier(num_classes, cache_dir, device)
-        mu_r, cov_r, ent_r = build_reference(
+        mu_r, cov_r, ent_r, counts_r = build_reference(
             net, args.npy_dir, label_fn, num_classes, real_crop, cache_dir, device, args.batch, mode
         )
-        ctx[mode] = dict(net=net, num_classes=num_classes, mu_r=mu_r, cov_r=cov_r, ent_r=ent_r)
+        ctx[mode] = dict(net=net, num_classes=num_classes, mu_r=mu_r, cov_r=cov_r, ent_r=ent_r,
+                         counts_r=counts_r, digit_indices=meta["digit_indices"])
+
+    # Digit-subset coverage rides on the content classifier -- no extra sampling.
+    digit_indices = ctx.get("content", {}).get("digit_indices", [])
+    if args.digit_coverage == "on" and not digit_indices:
+        sys.exit(
+            "[eval] --digit-coverage on needs content mode and a digit subset: pass "
+            "--label-mode content|both and an --npy-dir whose clip_labels.json lists "
+            "digit_classes (Speech Commands only)"
+        )
+    do_digits = bool(digit_indices) and args.digit_coverage != "off"
+    digit_ref = (float("nan"), float("nan"))
+    if do_digits:
+        counts_r = ctx["content"]["counts_r"]
+        if counts_r is None:
+            print("[eval] digit coverage: cached reference predates the class histogram -- real "
+                  "reference unavailable, pass --retrain to rebuild it")
+        else:
+            digit_ref = subset_coverage(counts_r, digit_indices)
+            print(f"[digits] real: fraction={digit_ref[0]:.3f}  entropy={digit_ref[1]:.3f}")
 
     ckpts = sorted(glob.glob(args.ckpt_glob), key=parse_iter)
     if not ckpts:
         sys.exit(f"[eval] no checkpoints matched {args.ckpt_glob}")
 
     mode_rows = {mode: [] for mode in modes}
+    digit_rows = []
     for cp in ckpts:
         it = parse_iter(cp)
         warn_if_speaker_mismatch(args.npy_dir, cp)
@@ -523,19 +632,34 @@ def main():
             emb, preds = embed_and_predict(c["net"], mels, args.batch, device)
             mu_g, cov_g = gaussian_stats(emb)
             fd = frechet_distance(c["mu_r"], c["cov_r"], mu_g, cov_g)
-            ent = norm_entropy(preds, c["num_classes"])
+            counts = class_counts(preds, c["num_classes"])
+            ent = norm_entropy_from_counts(counts, c["num_classes"])
             mode_rows[mode].append((it, fd, ent))
             print(f"iter {it:>7}  [{mode:>7}]  FD={fd:10.3f}  entropy={ent:.3f}  (real={c['ent_r']:.3f})")
+            if mode == "content" and do_digits:
+                frac, dent = subset_coverage(counts, digit_indices)
+                digit_rows.append((it, frac, dent))
+                print(f"iter {it:>7}  [ digits]  fraction={frac:.3f}  entropy={dent:.3f}  "
+                      f"(real fraction={digit_ref[0]:.3f} entropy={digit_ref[1]:.3f})")
         del G
         if device == "cuda":
             torch.cuda.empty_cache()
 
     # CSV per mode (ALL checkpoints, incl. iter 0 -- the sanity anchor).
+    panels = []
     for mode in modes:
-        write_csv(f"{args.out}_{mode}.csv", mode_rows[mode])
+        write_csv(f"{args.out}_{mode}.csv", mode_rows[mode], ["iter", "fd", "entropy"])
+        panels.append(dict(title=f"{mode} curve", rows=mode_rows[mode],
+                           y1label="Frechet distance", y2label="coverage entropy (norm.)",
+                           y2ref=ctx[mode]["ent_r"]))
+    if digit_rows:
+        write_csv(f"{args.out}_digits.csv", digit_rows, ["iter", "digit_fraction", "digit_entropy"])
+        panels.append(dict(title="digit sub-manifold coverage (OOD read)", rows=digit_rows,
+                           y1label="fraction predicted zero-nine", y2label="digit entropy (norm.)",
+                           y2ref=digit_ref[1], y1lim=(0, 1.05)))
 
     # One PNG: a panel per mode (iter-0 omitted by default).
-    write_plot(f"{args.out}.png", mode_rows, {m: ctx[m]["ent_r"] for m in modes}, args.plot_omit_iter0)
+    write_plot(f"{args.out}.png", panels, args.plot_omit_iter0)
 
 
 if __name__ == "__main__":
