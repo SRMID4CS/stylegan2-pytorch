@@ -4,7 +4,7 @@ Persistent project context for humans and LLM agents working on this repo.
 Logs what is **done**, what is **in progress**, and what is **to be done**.
 Update at the end of each implementation session (see Update Protocol at the bottom).
 
-All technical decisions are **locked in `GAN_TRAINING_SPEC.md`** — this file tracks
+All technical decisions are **locked in `docs/GAN_TRAINING_SPEC.md`** — this file tracks
 execution order and status only. On any conflict, the spec wins; surface conflicts,
 do not work around them.
 
@@ -359,4 +359,6 @@ implement here):**
 2. Record **open issues / blockers** and any resolved "open decisions".
 3. List **next-session first tasks** (3–5, ordered).
 4. Update `USAGE.md` if commands/flags changed; `README_AUDIO.md` only if
-   goals/defaults changed. `GAN_TRAINING_SPEC.md` changes only by explicit decision.
+   goals/defaults changed. The `docs/` specs change only by explicit decision —
+   and if a locked value moves, update the "contract at a glance" summary in
+   `README_AUDIO.md` in the same commit so the two can't drift.

@@ -118,7 +118,7 @@ python train.py --size 128 --batch 8 --img_channels 1 --dataset npy \
   --seed 0 data/npy_audiomnist
 ```
 
-### Speech Commands v0.02 (`SPEECH_COMMANDS_SPEC.md`)
+### Speech Commands v0.02 (`docs/SPEECH_COMMANDS_SPEC.md`)
 
 A **second, independent** generator — one per dataset, no cross-dataset prior.
 Everything except `m_hi`, the dataset name, the speaker lists and `split_seed` is
