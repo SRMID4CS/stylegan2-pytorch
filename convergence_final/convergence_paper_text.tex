@@ -1,0 +1,156 @@
+% =====================================================================
+% Convergence of the StyleGAN2 mel priors: paper text + figure blocks.
+% Figures come from `python eval/plot_convergence_paper.py` (stylegan2-pytorch repo),
+% written to convergence_final/{AM,SC}/fig*.pdf -- copy them into figures/.
+% Needs \usepackage{graphicx}. Every number below is printed by that script's
+% summary; re-check them if the curves are regenerated.
+% =====================================================================
+
+\paragraph{Monitoring prior convergence.}
+Inception-based FID is not meaningful for log-mel spectrograms, so we track each
+generator with a mel-native analogue. For each dataset we train a small CNN
+classifier (four stride-2 convolution blocks, global average pooling, and a 128-d
+embedding) on the real mel spectrograms of the training speakers only. We train one
+classifier for \emph{speaker identity} ($K{=}50$ speakers for AudioMNIST,
+$K{=}2{,}418$ for Speech Commands) and one for \emph{content} (10 digits for
+AudioMNIST, 35 keywords for Speech Commands). Every 10k iterations we draw
+$N{=}2{,}000$ samples from the EMA generator with a fixed seed. The seed freezes both
+the latent codes and the per-layer noise, so differences between checkpoints reflect
+the generator alone. For each classifier we then compute two statistics:
+(i)~the Fr\'echet distance (FD) between Gaussian fits to the 128-d embeddings of
+generated and real mel spectrograms, which measures distributional fidelity; and
+(ii)~the normalized coverage entropy $H(\hat{p})/\log K$ of the histogram $\hat{p}$ of
+predicted classes over the $N$ samples, which drops when the generator collapses onto
+a subset of speakers or words. The real-data reference is the same entropy computed on
+the training set. For Speech Commands, $K > N$ caps the attainable entropy at
+$\log N/\log K = 0.976$, so we resample the real histogram to $N$ samples and give
+both sides the same ceiling. The speaker metrics are our primary signal: content
+classifiers saturate and cannot detect a collapse of the speaker manifold, and speaker
+diversity is what a prior needs to reconstruct speakers it never saw. Each dataset
+has its own classifier, so FD values can be compared only along a single curve, not
+across datasets or with image FID. For the Speech Commands prior we also measure how
+the 35-way keyword classifier labels its samples on the ten digit words
+(\emph{zero}--\emph{nine}). We report the fraction of samples assigned to a digit and
+the normalized entropy over the ten digits. This is the sub-manifold that matters when
+the prior is used out of distribution on AudioMNIST targets.
+
+\paragraph{Convergence curves.}
+Figures~\ref{fig:conv-am} and~\ref{fig:conv-sc} show both statistics over training.
+On AudioMNIST, speaker FD drops by an order of magnitude within the first 110k
+iterations (32.0 to 3.8) and reaches its minimum of 3.05 at 300k. Over the same span,
+speaker coverage entropy rises from 0.857 to 0.977, within 0.010 of the real-data
+value (0.987). Digit FD falls from 1.88 to 0.46, and digit entropy stays above 0.99
+from 30k onward (real: 0.998). Content coverage therefore saturates early, and later
+training mainly improves speaker coverage. A single excursion at 230k (speaker FD
+27.2, speaker entropy 0.896) recovers by the next checkpoint. On Speech Commands,
+speaker FD falls 20-fold, from 247 at 10k to 12.6 at 400k, and stays between 12.1
+and 14.6 from 320k onward. Speaker entropy plateaus between 0.79 and 0.81 from 160k
+onward, against a size-matched real-data value of 0.848. Keyword FD falls from 12.5
+to 0.55, and keyword entropy rises from 0.777 to 0.927 (real: 0.938).
+Figure~\ref{fig:conv-sc-digits} shows the digit sub-manifold. The fraction of samples
+classified as a digit settles at $0.389 \pm 0.008$ (mean $\pm$ s.d.\ over the last
+ten checkpoints), matching the 0.384 that the same classifier assigns to real
+training data. Digit entropy reaches 0.967 (real: 0.972). The prior thus gives digits
+the same share of its samples as the data does and spreads them almost as evenly
+across the ten digits. All real-data references are computed on the classifiers' own
+training data, so they are optimistic targets.
+
+\paragraph{Checkpoint selection.}
+We select checkpoints on the speaker metrics, then check that the content metrics are
+at or near their best. For AudioMNIST we use the 300k checkpoint. It has both the
+lowest speaker FD (3.05) and the highest speaker coverage entropy (0.977) of the run,
+as well as the highest digit entropy (0.997). Its digit FD (0.457) is within 4\% of
+the run minimum (0.441 at 210k). For Speech Commands we use the final 400k
+checkpoint. Its speaker FD (12.6) is within 5\% of the run minimum (12.1 at 360k).
+That gap is smaller than the checkpoint-to-checkpoint variation on the plateau
+(s.d.\ 1.1 over the last ten checkpoints), so we prefer the longest-trained model.
+It also has the highest keyword entropy of the run (0.927), and its digit fraction
+(0.389) and digit entropy (0.967) match the real-data values (0.384 and 0.972).
+
+% ---------------------------------------------------------------------
+% Figures in the current plan: 6 (AM), 7 (SC), 5 (SC digit / OOD).
+% Combined figures are drawn at 5.5in (= \linewidth), single ones at 2.75in
+% (= 0.5\linewidth), so these widths render the fonts at their native 7--8pt.
+% ---------------------------------------------------------------------
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig6_am_speaker_content.pdf}
+  \caption{Convergence of the AudioMNIST prior, measured in the embedding of a
+  classifier trained on real training-speaker mel spectrograms for (a)~speaker
+  identity (50 speakers) and (b)~spoken digit. Top: Fr\'echet distance (FD, log
+  scale; lower is better) between 2{,}000 generator samples and the real training
+  set. Bottom: normalized coverage entropy of the predicted classes (higher is
+  better); dashed line: the same statistic on real training data. Orange: selected
+  checkpoint (300k), with its values annotated. The untrained iteration-0
+  checkpoint is omitted.}
+  \label{fig:conv-am}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig7_sc_speaker_content.pdf}
+  \caption{Convergence of the Speech Commands prior, measured in the embedding of a
+  classifier trained on real training-speaker mel spectrograms for (a)~speaker
+  identity (2{,}418 speakers) and (b)~keyword (35 words). Top: Fr\'echet distance
+  (FD, log scale; lower is better) between 2{,}000 generator samples and the real
+  training set. Bottom: normalized coverage entropy of the predicted classes (higher
+  is better); dashed line: the same statistic on real training data, resampled to
+  2{,}000 clips to match the sample size. Orange: selected checkpoint (400k), with
+  its values annotated. The untrained iteration-0 checkpoint is omitted.}
+  \label{fig:conv-sc}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.5\linewidth]{figures/fig5_sc_digits.pdf}
+  \caption{Coverage of the digit sub-manifold by the Speech Commands prior, the
+  relevant sub-manifold for out-of-distribution attacks on AudioMNIST. Top: fraction
+  of 2{,}000 samples that the 35-way keyword classifier assigns to one of the ten
+  digit words (\emph{zero}--\emph{nine}). Bottom: normalized entropy of the predicted
+  digits (higher is more uniform). Dashed lines: the same statistics on real
+  training data. Orange: selected checkpoint (400k).}
+  \label{fig:conv-sc-digits}
+\end{figure}
+
+% ---------------------------------------------------------------------
+% Alternatives: single-curve figures 1--4 (each 0.5\linewidth). To place two side
+% by side, put two \includegraphics[width=0.49\linewidth]{...} in one figure.
+% ---------------------------------------------------------------------
+%
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=0.5\linewidth]{figures/fig1_am_speaker.pdf}
+%   \caption{AudioMNIST prior, speaker-identity embedding (50 speakers). Top: FD
+%   (log scale; lower is better). Bottom: normalized coverage entropy (higher is
+%   better); dashed: real training data. Orange: selected checkpoint (300k).}
+%   \label{fig:conv-am-speaker}
+% \end{figure}
+%
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=0.5\linewidth]{figures/fig2_am_content.pdf}
+%   \caption{AudioMNIST prior, spoken-digit embedding. Top: FD (log scale; lower is
+%   better). Bottom: normalized coverage entropy (higher is better); dashed: real
+%   training data. Orange: selected checkpoint (300k).}
+%   \label{fig:conv-am-content}
+% \end{figure}
+%
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=0.5\linewidth]{figures/fig3_sc_speaker.pdf}
+%   \caption{Speech Commands prior, speaker-identity embedding (2{,}418 speakers).
+%   Top: FD (log scale; lower is better). Bottom: normalized coverage entropy (higher
+%   is better); dashed: real training data resampled to 2{,}000 clips. Orange:
+%   selected checkpoint (400k).}
+%   \label{fig:conv-sc-speaker}
+% \end{figure}
+%
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=0.5\linewidth]{figures/fig4_sc_content.pdf}
+%   \caption{Speech Commands prior, keyword embedding (35 words). Top: FD (log scale;
+%   lower is better). Bottom: normalized coverage entropy (higher is better); dashed:
+%   real training data resampled to 2{,}000 clips. Orange: selected checkpoint (400k).}
+%   \label{fig:conv-sc-content}
+% \end{figure}

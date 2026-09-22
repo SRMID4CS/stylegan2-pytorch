@@ -291,6 +291,31 @@ python eval/convergence_curve.py \
 - Relative tripwire only — not an absolute FID, never report the number outside
   this repo (ROADMAP.md "FID on mels" decision).
 
+### Paper figures from the convergence CSVs (`eval/plot_convergence_paper.py`)
+
+Redraws the curves above as print-ready figures with the chosen checkpoint marked.
+Standalone — numpy + matplotlib only (no torch), so any env with matplotlib runs it.
+It reads the `convergence_curve_{speaker,content,digits}.csv` files in
+`convergence_final/{AM,SC}/` and the real-data reference lines from
+`convergence_cache/`, and writes each figure next to its CSVs as `.pdf` (TrueType
+fonts) + 300-dpi `.png`:
+
+```bash
+python eval/plot_convergence_paper.py                     # AM ckpt 300k, SC ckpt 400k
+python eval/plot_convergence_paper.py --am-ckpt 300000 --sc-ckpt 400000 --no-titles
+#   AM/fig1_am_speaker  AM/fig2_am_content  AM/fig6_am_speaker_content (1+2 side by side)
+#   SC/fig3_sc_speaker  SC/fig4_sc_content  SC/fig5_sc_digits  SC/fig7_sc_speaker_content (3+4)
+```
+
+- Each curve is FD (log scale) over coverage entropy on a shared iteration axis;
+  iter 0 is left off. The reference line is the size-matched real entropy exactly as
+  `convergence_curve.py` plots it (keep `--n-samples`/`--seed` equal to the eval's).
+- Single figures are 2.75 in wide (half the ICLR text width), combined ones 5.5 in,
+  so they drop into LaTeX at native font size.
+- The script prints the values behind the figures (selected, best, last-10 mean/s.d.,
+  reference). `convergence_final/convergence_paper_text.tex` quotes them — re-check
+  it after regenerating the curves.
+
 ### AWS run scripts (`sweep.sh`, `train_full.sh`)
 
 Both are dataset-agnostic — every knob is an env override, and the defaults
